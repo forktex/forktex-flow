@@ -1,0 +1,72 @@
+# Copyright (C) 2026 FORKTEX S.R.L.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-ForkTex-Commercial
+#
+# This file is part of ForkTex Flow.
+#
+# For commercial licensing -- including use in proprietary products, SaaS
+# deployments, or any context where AGPL obligations cannot be met -- you
+# MUST obtain a commercial license from FORKTEX S.R.L. (info@forktex.com).
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+name: Publish Python Package
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    # `make smoke` runs the built wheel against a real Postgres through
+    # testcontainers, which needs the Docker daemon ubuntu-latest provides.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install poetry
+        run: pipx install 'poetry>=2.0,<3.0'
+
+      # 3.14, not "3.x". The floor is `requires-python = ">=3.14"`, and an
+      # older interpreter does not fail loudly here: pip hides every release
+      # whose floor it does not meet, so the substrate silently resolves to an
+      # unrelated 0.2.x lineage and the failure surfaces as a baffling
+      # dependency error rather than a version mismatch (`python:target-314`).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "poetry"
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      # A PyPI version is immutable, so the gate runs BEFORE the upload, not
+      # only on the merge that preceded it: a release can be cut from any ref.
+      # `make ci` ends in `release-check`, which is re-run here with the tag so
+      # a tag disagreeing with pyproject.toml stops the publish.
+      # No build or lint logic is inlined — `gate:ci-is-one-command`.
+      - name: Run the full gate
+        run: poetry run make ci
+
+      - name: Check the tag against the declared version
+        run: poetry run make release-check TAG=${{ github.ref_name }}
+
+      # `make ci` already built and verified dist/ via `make build`
+      # (python -m build + twine check). Publish exactly those artefacts
+      # rather than rebuilding something unverified.
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

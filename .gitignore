@@ -1,0 +1,30 @@
+__pycache__
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# local Claude Code state (per-user)
+.claude/
+
+# forktex CLI runtime workspace — nothing in this repo creates or reads it now
+# (the CLI is in backlog/py/), but ignore it so a globally-installed `forktex`
+# run from this directory cannot commit its state or secrets.
+.forktex/
+
+# Credentials. Nothing here reads these today; they are ignored because the
+# cost of the mistake is asymmetric — a committed key lives in history after
+# the file is deleted, and the sibling cloud repo has one in its history now.
+.env
+.env.*
+!.env.example
+.mcp.json
+*.pem
+*.key

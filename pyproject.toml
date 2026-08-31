@@ -1,0 +1,148 @@
+# Copyright (C) 2026 FORKTEX S.R.L.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-ForkTex-Commercial
+#
+# This file is part of ForkTex Flow.
+#
+# For commercial licensing -- including use in proprietary products, SaaS
+# deployments, or any context where AGPL obligations cannot be met -- you
+# MUST obtain a commercial license from FORKTEX S.R.L. (info@forktex.com).
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+[project]
+name = "forktex-flow"
+version = "0.1.0"
+description = "Postgres-native durable workflow execution — pipelines and cron-scheduled runs, built on the forktex substrate."
+authors = [
+    {name = "FORKTEX",email = "info@forktex.com"}
+]
+readme = "README.md"
+# Dual-licensed: AGPL-3.0-or-later for OSS use; a proprietary commercial
+# license is also available (see LICENSE + NOTICE; info@forktex.com).
+license = "AGPL-3.0-or-later OR LicenseRef-ForkTex-Commercial"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.14,<4.0"
+# 4 - Beta: the engine has run in anger under `forktex-core[flow]`, but this
+# distribution name and its reduced surface are new and not yet field-proven.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Software Development",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+# Every dependency here is required by the shipped surface: `@scheduled` is
+# half the public API and cannot work without croniter, so there is no
+# optional-import boundary to declare and no empty extra that would resolve to
+# nothing.
+#
+# `forktex` is the substrate — engine/session lifecycle, ORM bases, DDL
+# constructs, advisory locks, pagination and the SQL migration runner. Plain,
+# not `forktex[database]`: sqlalchemy, asyncpg and pydantic are core
+# requirements of that distribution, not members of its `database` extra, so
+# the extra would add nothing. They are still named here because this package
+# imports them directly, and a dependency you import is one you declare — a
+# transitive dep that stops being transitive is not a breaking change upstream.
+#
+# Note that `forktex` pulls redis in unconditionally; nothing here uses it.
+dependencies = [
+    "forktex>=0.11,<1",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.31",
+    "pydantic>=2.0",
+    "croniter>=2.0",
+]
+
+[project.optional-dependencies]
+# `forktex_flow.testing` needs a real Postgres to hand a consumer an isolated
+# schema. The module imports without it — only `isolated_flow` reaches a
+# database — so this is an extra rather than a dependency.
+testing = ["testcontainers[postgres]>=4.0"]
+
+# No [project.scripts]: this distribution is a library. A check that needs
+# running is a function returning a report, wired into the consumer's pipeline.
+
+[project.urls]
+"Homepage" = "https://forktex.com"
+"Repository" = "https://github.com/forktex/forktex-flow"
+"Documentation" = "https://github.com/forktex/forktex-flow/tree/master/docs"
+"Changelog" = "https://github.com/forktex/forktex-flow/blob/master/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/forktex/forktex-flow/issues"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+packages = [{ include = "forktex_flow", from = "src" }]
+include = [
+    { path = "src/forktex_flow/py.typed", format = ["sdist", "wheel"] },
+    # The migrations are data, not code: without them in the wheel
+    # `SchemaMigrationRunner` finds an empty directory and `Flow.init()`
+    # brings up a schema with no tables.
+    { path = "src/forktex_flow/persist/migrations/*.sql", format = ["sdist", "wheel"] },
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8.0",
+    "pyright>=1.1.350",
+    "pip-audit>=2.7.0",
+    "build>=1.2.0",
+    "twine>=5.0.0",
+    "testcontainers[postgres]>=4.0",
+]
+
+[tool.ruff]
+# py314, matching requires-python. Never lower it: py313 reads PEP 758
+# `except A, B:` as a syntax error and PEP 695 generic self-references as
+# F821, both of which this project uses legitimately.
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ANN"]
+
+[tool.ruff.lint.per-file-ignores]
+# `src/` carries NO exemptions — every module passes the full strict set,
+# `ANN401` included. A new `Any` in a signature is a prompt to name the type,
+# not to add a line here.
+# Tests: baseline only (test code isn't held to the annotation/strict set).
+"tests/**" = ["E1", "E2", "E5", "I", "UP", "B", "SIM", "RUF", "ANN"]
+
+[tool.pyright]
+include = ["src"]
+exclude = ["**/__pycache__"]
+pythonVersion = "3.14"
+typeCheckingMode = "basic"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = [".venv", "dist", "build"]
+log_cli = false
+log_level = "WARNING"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
