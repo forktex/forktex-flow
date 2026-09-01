@@ -33,7 +33,7 @@ cannot be confused because the second requires ``fn`` positionally.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, overload
 
 from forktex.error import BadRequestError
 from forktex.types import BaseValueObject
@@ -88,6 +88,37 @@ def step_meta(fn: object) -> StepMeta | None:
 def has_step_meta(fn: object) -> bool:
     """True if ``fn`` was decorated with :func:`step`."""
     return isinstance(getattr(fn, _STEP_META_ATTR, None), StepMeta)
+
+
+# The three call shapes, declared separately so a caller gets the type it
+# actually receives. A single union return is technically true and practically
+# useless: `@step` hands back the function unchanged, but a union makes every
+# later `step(decorated, when=...)` and `scheduled(...)(decorated)` an error —
+# 13 of them in ForkTex Cloud, against code written exactly as the README shows.
+@overload
+def step(fn: Callable[..., Any], /) -> Callable[..., Any]: ...
+
+
+@overload
+def step(
+    fn: Callable[..., Any],
+    /,
+    *,
+    max_attempts: int | None = ...,
+    backoff: tuple[float, ...] | None = ...,
+    when: Callable[[dict[str, Any]], bool] | None = ...,
+) -> StepSpec: ...
+
+
+@overload
+def step(
+    fn: None = ...,
+    /,
+    *,
+    max_attempts: int | None = ...,
+    backoff: tuple[float, ...] | None = ...,
+    when: Callable[[dict[str, Any]], bool] | None = ...,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]: ...
 
 
 def step(

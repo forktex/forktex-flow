@@ -219,13 +219,17 @@ class Driver:
                         workflow_name=defn.name,
                         workflow_version=defn.version,
                         cron=cron,
-                        enabled=True,
+                        enabled=defn.enabled,
                         next_fire_at=croniter(cron, now).get_next(datetime),
                     )
                     # The cron is updated on conflict so editing a schedule in
                     # code takes effect; `next_fire_at` is left alone, so the
                     # new expression applies from the next fire rather than
                     # retroactively moving a deadline that may already be due.
+                    # `enabled` is deliberately absent: it is set from the
+                    # definition on the first insert and owned by the database
+                    # afterwards, so an operator arming a schedule keeps it
+                    # armed across every subsequent deploy.
                     .on_conflict_do_update(
                         index_elements=[ScheduledRun.workflow_name, ScheduledRun.workflow_version],
                         set_={"cron": cron},

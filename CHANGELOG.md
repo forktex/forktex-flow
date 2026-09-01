@@ -3,6 +3,36 @@
 All notable changes to `forktex-flow` are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-08-31
+
+### Added
+
+- **`flow.scheduled(..., enabled=False)`** registers a cron without arming its
+  timer. The workflow is registered and still dispatchable through `flow.run()`;
+  only the schedule is off. It exists for a cron whose first tick is destructive
+  — ForkTex Cloud's `reap_expired_servers` dispatches a destroy against expired
+  infrastructure every five minutes — where arming on boot and disarming
+  afterwards loses the race: the first tick can land before anyone runs the
+  UPDATE.
+
+  The flag is read when the row is **first written**. From then on the database
+  owns it: the upsert refreshes `cron` and deliberately leaves `enabled` alone,
+  so `UPDATE scheduled_run SET enabled = true` is how a schedule is armed and no
+  later deploy re-arms or disarms one behind an operator. Both halves are
+  tested, and each was verified to fail with its own half reverted.
+
+  No new public name; `__all__` is unchanged at 26.
+
+### Fixed
+
+- **`step` was typed as a union its callers could not use.** A bare `@step`
+  returns the function unchanged, but the single `Callable | StepSpec` return
+  meant every later `step(decorated, when=…)` and `scheduled(...)(decorated)`
+  failed type checking — 13 errors in ForkTex Cloud, against code written
+  exactly as this README shows it. Replaced with three `@overload` signatures,
+  one per call shape, so a caller gets the type it actually receives. No
+  runtime change.
+
 ## [0.1.0] — 2026-08-31
 
 First release under this distribution name. The engine previously shipped as

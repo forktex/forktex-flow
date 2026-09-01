@@ -82,6 +82,12 @@ class WorkflowDefinition(BaseModel):
                    ``Annotated`` hints on ``state_cls``. A field with no
                    reducer is last-write-wins.
         schedule:  Cron expression, or ``None`` for on-demand workflows.
+        enabled:   Whether a scheduled workflow is *armed* when its row is first
+                   written. Ignored for on-demand workflows. ``False`` registers
+                   the schedule without firing it, for a cron whose first tick
+                   is destructive and wants a deliberate hand to start it. Only
+                   the first insert reads this — after that the database is
+                   authoritative, so operating the switch is a plain UPDATE.
     """
 
     name: str
@@ -90,6 +96,7 @@ class WorkflowDefinition(BaseModel):
     nodes: tuple[NodeDef, ...] = ()
     reducers: dict[str, ReducerFn] = Field(default_factory=dict)
     schedule: str | None = None
+    enabled: bool = True
 
     @model_validator(mode="after")
     def _check_topology(self) -> WorkflowDefinition:

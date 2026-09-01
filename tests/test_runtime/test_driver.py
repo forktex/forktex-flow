@@ -170,6 +170,69 @@ async def test_editing_a_cron_in_code_updates_the_stored_schedule(flow: Flow):
 
 
 @pytest.mark.asyncio
+async def test_a_schedule_registered_disabled_gets_a_row_and_does_not_fire(flow: Flow):
+    """`enabled=False` registers the timer without starting it.
+
+    The case this exists for is a cron whose first tick is destructive — a
+    reaper that dispatches a destroy against expired infrastructure. Arming it
+    the instant the process boots, and disarming afterwards, loses that race:
+    the first tick can land before anyone runs the UPDATE.
+    """
+
+    async def body(ctx: Ctx, state: State) -> dict:
+        return {"logs": ["fired"]}
+
+    # A cron that is due every minute, so "did not fire" is a real assertion
+    # rather than an artefact of nothing being due yet.
+    flow.scheduled("t.disarmed", version=1, cron="* * * * *", state=State, enabled=False)(body)
+    driver = _driver(flow)
+    await driver._fire_due_schedules()
+    await driver._fire_due_schedules()
+
+    async with flow.session() as session:
+        row = (
+            await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.disarmed"))
+        ).scalar_one()
+        runs = (await session.execute(select(Run).where(Run.workflow_name == "t.disarmed"))).scalars().all()
+
+    assert row.enabled is False, "the row exists but must not be armed"
+    assert runs == [], "a disabled schedule dispatched a run"
+
+
+@pytest.mark.asyncio
+async def test_arming_a_schedule_survives_re_registration(flow: Flow):
+    """Once armed, the database owns the switch.
+
+    `enabled` is read on the first insert only. If re-registration wrote it
+    back, every deploy would silently re-disarm a schedule an operator had
+    turned on — or worse, re-arm one they had turned off, which is how a reaper
+    comes back from the dead. The upsert updates `cron` and nothing else.
+    """
+
+    async def body(ctx: Ctx, state: State) -> dict:
+        return {}
+
+    flow.scheduled("t.armed", version=1, cron="0 1 * * *", state=State, enabled=False)(body)
+    await _driver(flow)._fire_due_schedules()
+
+    async with flow.session() as session:
+        await session.execute(update(ScheduledRun).where(ScheduledRun.workflow_name == "t.armed").values(enabled=True))
+        await session.commit()
+
+    # A fresh process registering the same workflow — still declaring it
+    # disabled, as the code always will.
+    revised = Flow(database=flow._db, schema=flow.schema)
+    revised.scheduled("t.armed", version=1, cron="0 2 * * *", state=State, enabled=False)(body)
+    await _driver(revised)._fire_due_schedules()
+
+    async with flow.session() as session:
+        row = (await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.armed"))).scalar_one()
+
+    assert row.enabled is True, "re-registration disarmed a schedule an operator had armed"
+    assert row.cron == "0 2 * * *", "the cron should still track the code"
+
+
+@pytest.mark.asyncio
 async def test_the_driver_claims_and_completes_a_pending_run(flow: Flow):
     """The whole loop, once: a submitted run is claimed, dispatched, executed
     and marked completed without anyone calling the executor directly."""

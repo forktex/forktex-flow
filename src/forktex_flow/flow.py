@@ -237,12 +237,32 @@ class Flow:
         version: int,
         cron: str,
         state: type | None = None,
+        enabled: bool = True,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register one async function to run on a cron schedule."""
+        """Register one async function to run on a cron schedule.
+
+        ``enabled=False`` writes the schedule's row without arming it, for a
+        cron whose first tick does something you want to authorise by hand — a
+        reaper that destroys expired infrastructure, say. The workflow is
+        registered and dispatchable through :meth:`run`; only the timer is off.
+
+        The flag is read when the row is **first** written. From then on the
+        database is authoritative and re-registration leaves it alone, so
+        ``UPDATE scheduled_run SET enabled = true`` is how it is turned on and a
+        later deploy will not silently re-arm or disarm it.
+        """
 
         def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             self._registry.register(
-                compile_scheduled(fn, name=name, version=version, cron=cron, state_cls=state, defaults=self._config)
+                compile_scheduled(
+                    fn,
+                    name=name,
+                    version=version,
+                    cron=cron,
+                    state_cls=state,
+                    enabled=enabled,
+                    defaults=self._config,
+                )
             )
             return fn
 

@@ -88,6 +88,7 @@ def compile_scheduled(
     version: int,
     cron: str,
     state_cls: type | None = None,
+    enabled: bool = True,
     defaults: RuntimeConfig | None = None,
 ) -> WorkflowDefinition:
     """Compile one async function into a single-step workflow on a cron."""
@@ -107,6 +108,7 @@ def compile_scheduled(
         ),
         reducers=extract_reducers(state_cls),
         schedule=cron,
+        enabled=enabled,
     )
 
 

@@ -92,7 +92,7 @@ something executes.
 | `await stop_driver()` | Stop cleanly. Idempotent, and safe before any start. |
 | `await close()` | `stop_driver()`, then dispose the pool **only if this `Flow` created it**. |
 | `pipeline(name, *, version, state=None, cron=None)` | Class decorator over a `steps` list. |
-| `scheduled(name, *, version, cron, state=None)` | Function decorator. |
+| `scheduled(name, *, version, cron, state=None, enabled=True)` | Function decorator. `enabled=False` registers the schedule without arming its timer; read only when the row is first created, so the database stays authoritative afterwards. |
 | `registered() -> list[str]` | Every workflow name declared in this process. |
 | `await run(name, *, state=None, metadata=None, version=None) -> WorkflowInstance` | Insert a run `pending` and return a handle. The driver picks it up on its next tick. Labelled `triggered_by="manual"`. |
 | `await get(run_id) -> WorkflowInstance` | Raises `NotFoundError` if absent. |

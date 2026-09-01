@@ -23,7 +23,7 @@
 
 [project]
 name = "forktex-flow"
-version = "0.1.0"
+version = "0.2.0"
 description = "Postgres-native durable workflow execution — pipelines and cron-scheduled runs, built on the forktex substrate."
 authors = [
     {name = "FORKTEX",email = "info@forktex.com"}

@@ -174,6 +174,12 @@ async def reconcile(ctx: Ctx, state: State) -> dict:
 
 Registered on every worker; fired once, by whichever holds the lock.
 
+`enabled=False` writes the schedule's row without starting its timer — for a
+cron whose first tick is destructive and wants a deliberate hand. The flag is
+read once, when the row is created; after that the database owns the switch, so
+`UPDATE scheduled_run SET enabled = true` arms it and no later deploy re-arms or
+disarms it behind you.
+
 ### Per-step retries
 
 ```python
