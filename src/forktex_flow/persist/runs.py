@@ -43,7 +43,7 @@ from sqlalchemy.orm import selectinload
 
 from forktex_flow.domain.types import TERMINAL_STATUSES, RunInfo, RunStatus
 from forktex_flow.persist.mappers import to_run_info
-from forktex_flow.persist.models import Run, RunEvent
+from forktex_flow.persist.models import Run, RunEvent, StepRun
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection
@@ -210,10 +210,45 @@ async def claim_pending_runs(store: FlowStore, limit: int) -> list[tuple[UUID, s
     instead of racing over it: ``with_for_update(skip_locked=True)`` on a scalar
     subquery renders the locking clause *inside* the subselect, which is where
     Postgres needs it for the atomicity to hold.
+
+    **Runs waiting on a retry backoff are skipped.** A step that asks to be
+    retried sets ``next_attempt_at`` and the run goes straight back to
+    ``pending`` (``execution.py``, ``StepRetryRequested``). Claiming on status
+    alone therefore re-dispatched it on the very next driver tick — a second
+    later — and the backoff a step declared was never waited. `@step(backoff=(15,
+    30, 60), max_attempts=720)` reads as hours of patience and delivered twelve
+    minutes of busy-looping against whatever the step was polling.
+
+    A run is skipped only while it is *actually* blocked: it has a pending step
+    scheduled in the future and no pending step that is due. A fresh run with no
+    step rows, and a resumed run whose next step has not been created yet, both
+    still claim — the guard must not turn a backoff into a stall.
     """
+    blocked_until_later = (
+        select(StepRun.id)
+        .where(
+            StepRun.run_id == Run.id,
+            StepRun.status == "pending",
+            StepRun.next_attempt_at.isnot(None),
+            StepRun.next_attempt_at > sa.func.now(),
+        )
+        .exists()
+    )
+    ready_now = (
+        select(StepRun.id)
+        .where(
+            StepRun.run_id == Run.id,
+            StepRun.status == "pending",
+            sa.or_(
+                StepRun.next_attempt_at.is_(None),
+                StepRun.next_attempt_at <= sa.func.now(),
+            ),
+        )
+        .exists()
+    )
     claimable = (
         select(Run.id)
-        .where(Run.status == "pending")
+        .where(Run.status == "pending", sa.or_(~blocked_until_later, ready_now))
         .order_by(Run.started_at.asc())
         .limit(limit)
         .with_for_update(skip_locked=True)

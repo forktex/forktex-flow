@@ -3,6 +3,35 @@
 All notable changes to `forktex-flow` are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.2.1] — 2026-10-13
+
+### Fixed
+
+- **A step's `backoff` is now actually waited.** `claim_pending_runs` selected on
+  `Run.status == "pending"` and nothing else. A step asking to be retried sets
+  `next_attempt_at` and the run goes straight back to `pending`
+  (`execution.py`, on `StepRetryRequested`), so the driver re-dispatched it on
+  the very next tick — a second later — and the declared delay was never
+  observed.
+
+  The consequence is not "slightly early". `@step(max_attempts=720,
+  backoff=(15, 30, 60))` reads as roughly half a day of patience and delivered
+  about twelve minutes of busy-looping: every wait built on retries — polling a
+  DNS record a human still has to create, holding a deploy until an operator
+  approves a plan — was an unadvertised twelve-minute timeout plus 720
+  pointless round-trips.
+
+  `_revive_runs_with_pending_steps` already gated on the due time, which is why
+  this survived a reading: that sweep is for runs stuck at `running`, and a
+  retrying run never passes through it.
+
+  A run is now skipped only while it is genuinely blocked — it has a pending
+  step scheduled in the future and no pending step that is due. A fresh run
+  with no step rows, and a run resumed between steps, both still claim; turning
+  a backoff into a stall would be the worse bug.
+
 ## [0.2.0] — 2026-08-31
 
 ### Added
