@@ -153,7 +153,7 @@ async def test_emit_from_inside_a_step_lands_in_the_event_log(flow: Flow):
         1,
     )
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         payloads = (
             (
                 await session.execute(

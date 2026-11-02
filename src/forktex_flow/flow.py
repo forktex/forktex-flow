@@ -131,11 +131,11 @@ class Flow:
     def engine(self) -> AsyncEngine:
         return self._store.engine
 
-    def session(self) -> AbstractAsyncContextManager[AsyncSession]:
-        """A read session on this Flow's pool. The engine owns this transaction: ``commit()`` raises
+    def transaction(self) -> AbstractAsyncContextManager[AsyncSession]:
+        """A read transaction on this Flow's pool. The engine owns the boundary: ``commit()`` raises
         ``TransactionBoundaryError``.
         """
-        return self._store.session()
+        return self._store.transaction()
 
     async def init(self) -> None:
         """Bring the schema up to date. Idempotent, and safe to call from every worker: concurrent callers

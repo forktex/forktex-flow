@@ -83,7 +83,7 @@ async def test_triggered_by_separates_manual_runs_from_scheduled_ones(flow: Flow
 
     driver = Driver(FlowRuntime(flow._store, flow._registry, flow._config, flow.extensions))
     await driver._fire_due_schedules()
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(update(ScheduledRun).values(next_fire_at=datetime.now(UTC) - timedelta(minutes=5)))
     await driver._fire_due_schedules()
 

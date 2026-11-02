@@ -112,7 +112,7 @@ async def test_a_stale_step_is_reclaimed_and_the_run_revived(flow: Flow):
     # The dead worker's trace: a claimed step, running, whose heartbeat stopped.
     # `mark_step_running` always stamps `heartbeat_at`, so a stale one is an old
     # timestamp, never NULL — backdate it rather than clearing it.
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         session.add(
             StepRun(
                 run_id=instance.instance_id,
@@ -274,7 +274,7 @@ async def test_a_run_whose_worker_died_between_steps_is_recovered(flow: Flow) ->
     # before writing any step row
     claimed = await _runs.claim_pending_runs(flow._store, limit=10)
     assert [c.run_id for c in claimed] == [run_id]
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(
             update(Run).where(Run.id == run_id).values(heartbeat_at=sa.func.now() - timedelta(seconds=3600))
         )
@@ -282,7 +282,7 @@ async def test_a_run_whose_worker_died_between_steps_is_recovered(flow: Flow) ->
     driver = Driver(FlowRuntime(flow._store, flow._registry, flow._config, flow.extensions))
     await driver._revive_abandoned_runs()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(Run).where(Run.id == run_id))).scalar_one()
     assert row.status == "pending", "a run with no live step was left stranded"
 

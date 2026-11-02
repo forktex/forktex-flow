@@ -72,7 +72,7 @@ async def insert_run(
     metadata: JsonObject,
     triggered_by: str = "manual",
 ) -> UUID:
-    async with store.session() as session:
+    async with store.transaction() as session:
         return await insert_run_in(
             session,
             store.schema,
@@ -132,7 +132,7 @@ async def update_run_status(
     if status == "cancelled":
         values["cancelled_at"] = sa.func.now()
 
-    async with store.session() as session:
+    async with store.transaction() as session:
         result = await session.execute(
             update(Run)
             .where(Run.id == run_id, Run.status.not_in(sorted(TERMINAL_STATUSES)))
@@ -150,7 +150,7 @@ async def heartbeat_run(store: FlowStore, run_id: UUID) -> bool:
     """Stamp the run alive. ``False`` when it is no longer ``running`` — another executor owns it, or it reached a
     terminal status, and the caller must stop.
     """
-    async with store.session() as session:
+    async with store.transaction() as session:
         result = await session.execute(
             update(Run).where(Run.id == run_id, Run.status == "running").values(heartbeat_at=sa.func.now())
         )
@@ -158,7 +158,7 @@ async def heartbeat_run(store: FlowStore, run_id: UUID) -> bool:
 
 
 async def fetch_run(store: FlowStore, run_id: UUID) -> RunInfo | None:
-    async with store.session() as session:
+    async with store.transaction() as session:
         row = (
             await session.execute(select(Run).options(selectinload(Run.steps)).where(Run.id == run_id))
         ).scalar_one_or_none()
@@ -176,7 +176,7 @@ async def update_run_output(
     so the step that was still running when an operator cancelled cannot write a successful-looking result over
     it.
     """
-    async with store.session() as session:
+    async with store.transaction() as session:
         await session.execute(
             update(Run).where(Run.id == run_id, Run.status.not_in(TERMINAL_STATUSES)).values(output=state)
         )
@@ -188,7 +188,7 @@ async def emit_run_event(
     event_type: str,
     payload: JsonObject | None = None,
 ) -> None:
-    async with store.session() as session:
+    async with store.transaction() as session:
         session.add(RunEvent(run_id=run_id, event_type=event_type, payload=payload or {}))
         await session.flush()
         await notify_run(await session.connection(), store.schema, run_id)
@@ -236,6 +236,6 @@ async def claim_pending_runs(store: FlowStore, limit: int) -> list[RunClaim]:
         .returning(Run.id, Run.workflow_name, Run.workflow_version)
         .execution_options(synchronize_session=False)
     )
-    async with store.session() as session:
+    async with store.transaction() as session:
         rows = (await session.execute(stmt)).all()
         return [RunClaim(run_id=r.id, workflow_name=r.workflow_name, workflow_version=r.workflow_version) for r in rows]

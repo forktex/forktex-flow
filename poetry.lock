@@ -1174,14 +1174,14 @@ files = [
 
 [[package]]
 name = "forktex"
-version = "0.14.0"
+version = "0.15.0"
 description = "The shared Python substrate for ForkTex services — logging, errors, types, and one facade per piece of infrastructure."
 optional = false
 python-versions = "<4.0,>=3.14"
 groups = ["main"]
 files = [
-    {file = "forktex-0.14.0-py3-none-any.whl", hash = "sha256:dfe5b078cd77050f2939578e53bc526233a2f9dc57a2dd023d13ea34c2f66b00"},
-    {file = "forktex-0.14.0.tar.gz", hash = "sha256:64f8cbfb799df45757cc09e1ef9b382ef8d42c2669adf214556ed2c1cfad021c"},
+    {file = "forktex-0.15.0-py3-none-any.whl", hash = "sha256:b67ff5660de882f7c573fe88fd2d671f193fd4c2c90ce44272be9cde51eac4cc"},
+    {file = "forktex-0.15.0.tar.gz", hash = "sha256:a32b9e5f7eec47781d102d40349b035c905f770bdd6a5b1b10a44f53439ffe32"},
 ]
 
 [package.dependencies]
@@ -3753,4 +3753,4 @@ testing = ["testcontainers"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.14,<4.0"
-content-hash = "dd9c835f90b7b039552c80a2b593169be7b0d1f976aa7afb96437f55aebde918"
+content-hash = "4573f16e05e9fa14a593d0294430a1a55bdda66250508404f2c46d033e92bd91"

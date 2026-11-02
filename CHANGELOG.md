@@ -5,6 +5,20 @@ All notable changes to `forktex-flow` are documented here. This project follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-02
+
+Requires `forktex>=0.15,<0.16`.
+
+### Breaking
+
+**`Flow.session()` is now `Flow.transaction()`**, and `FlowStore.session()` is
+`FlowStore.transaction()`. The method always owned the boundary and raised
+`TransactionBoundaryError` on `commit()`; forktex 0.15 gives `session()` the opposite meaning —
+a session whose boundary the caller owns — so keeping the old name would have inverted it.
+
+Replace `async with flow.session() as session:` with `async with flow.transaction() as session:`.
+
+
 ## [0.4.0] — 2026-11-01
 
 ### Fixed

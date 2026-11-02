@@ -93,7 +93,7 @@ async def fetch_page(
     # `len(rows) == limit` instead reports has_more on an exactly-full last page.
     stmt = stmt.limit(limit + 1)
 
-    async with store.session() as session:
+    async with store.transaction() as session:
         rows = (await session.execute(stmt)).scalars().all()
 
     has_more = len(rows) > limit
@@ -113,7 +113,7 @@ async def fetch_page(
 
 async def count_runs(store: FlowStore, spec: RunFilter) -> int:
     stmt = select(sa.func.count(Run.id)).where(*_filter_clauses(spec))
-    async with store.session() as session:
+    async with store.transaction() as session:
         return (await session.execute(stmt)).scalar_one()
 
 
@@ -132,7 +132,7 @@ async def summarise_runs(store: FlowStore, spec: RunFilter) -> RunSummary:
         .group_by(Run.status)
     )
 
-    async with store.session() as session:
+    async with store.transaction() as session:
         rows = (await session.execute(stmt)).all()
 
     by_status = {row.status: row.total for row in rows}

@@ -156,7 +156,7 @@ async def test_a_retry_schedules_the_next_attempt_rather_than_spinning(flow: Flo
     instance = await flow.run("t.backoff", state={})
     await execute_run(_runtime(flow), instance.instance_id, "t.backoff", 1)
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(StepRun).where(StepRun.run_id == instance.instance_id))).scalar_one()
 
     assert row.status == "pending", "a retryable failure returns the step to pending"
@@ -204,7 +204,7 @@ async def test_a_step_raising_workflow_cancelled_cancels_the_run(flow: Flow):
     assert final.nodes[0].status == "failed", "the step records that it did not complete"
 
     # The reason reaches the row an operator reads, not just the log.
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         reason = (await session.execute(select(Run.cancel_reason).where(Run.id == instance.instance_id))).scalar_one()
     assert "target was deleted" in reason
 
@@ -260,7 +260,7 @@ async def test_a_long_step_heartbeats_while_it_runs(flow: Flow, postgres_url_str
         instance = await fast.run("t.heartbeat", state={})
         await execute_run(_runtime(fast), instance.instance_id, "t.heartbeat", 1)
 
-        async with fast.session() as session:
+        async with fast.transaction() as session:
             row = (await session.execute(select(StepRun).where(StepRun.run_id == instance.instance_id))).scalar_one()
 
         assert row.status == "completed"
@@ -297,7 +297,7 @@ async def test_a_configured_default_reaches_an_undecorated_step(flow: Flow, post
         instance = await tuned.run("t.defaults", state={})
         await execute_run(_runtime(tuned), instance.instance_id, "t.defaults", 1)
 
-        async with tuned.session() as session:
+        async with tuned.transaction() as session:
             row = (await session.execute(select(StepRun).where(StepRun.run_id == instance.instance_id))).scalar_one()
 
         assert row.max_attempts == 7, "the configured default did not reach the step"
@@ -342,7 +342,7 @@ async def test_cancelling_a_running_run_is_not_reverted_by_the_executor(flow: Fl
     assert final.status == "cancelled", "the executor overwrote the cancellation"
     assert "should never run" not in final.state.get("logs", []), "a step ran after cancellation"
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(Run).where(Run.id == instance.instance_id))).scalar_one()
     assert row.cancel_reason == "cancelled by operator"
     assert row.cancelled_at is not None
@@ -390,7 +390,7 @@ async def test_cancelling_an_already_finished_run_changes_nothing(flow: Flow):
 
     final = await flow.get(instance.instance_id)
     assert final.status == "completed"
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(Run).where(Run.id == instance.instance_id))).scalar_one()
     assert row.cancel_reason is None, "a declined cancel must not stamp a reason"
 
@@ -411,7 +411,7 @@ async def test_a_step_finishing_after_a_cancel_does_not_overwrite_the_output(flo
     await _runs.update_run_status(flow._store, run_id, status="cancelled", error="by operator")
     await _runs.update_run_output(flow._store, run_id, {"looks": "successful"})
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(Run).where(Run.id == run_id))).scalar_one()
 
     assert row.status == "cancelled"

@@ -127,7 +127,7 @@ async def test_two_workers_executing_one_run_run_the_step_body_once(flow: Flow, 
             return_exceptions=True,
         )
 
-        async with flow.session() as session:
+        async with flow.transaction() as session:
             rows = (
                 await session.execute(
                     select(func.count()).select_from(StepRun).where(StepRun.run_id == instance.instance_id)
@@ -199,7 +199,7 @@ async def test_concurrent_upserts_of_one_step_converge_on_a_single_row(flow: Flo
         results = await asyncio.gather(claim(flow._store), claim(second_flow._store))
 
         assert results[0].step_id == results[1].step_id, "both workers must resolve to the same step row"
-        async with flow.session() as session:
+        async with flow.transaction() as session:
             count = (
                 await session.execute(
                     select(func.count()).select_from(StepRun).where(StepRun.run_id == instance.instance_id)
@@ -298,7 +298,7 @@ async def test_a_caller_cannot_commit_inside_the_engines_session(flow: Flow) -> 
     from forktex.database.errors import TransactionBoundaryError
 
     with pytest.raises(TransactionBoundaryError):
-        async with flow.session() as session:
+        async with flow.transaction() as session:
             await session.commit()
 
 
@@ -335,13 +335,13 @@ async def test_an_executor_that_lost_its_claim_cannot_write_the_step(flow: Flow,
     await _steps.mark_step_running(flow._store, step_id)
 
     # the driver reclaims it: back to pending, a new owner will claim it
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(update(StepRun).where(StepRun.id == step_id).values(status="pending", heartbeat_at=None))
 
     with pytest.raises(StepClaimLost):
         await write(flow._store, step_id)
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(StepRun).where(StepRun.id == step_id))).scalar_one()
     assert row.status == "pending", "the stale executor overwrote the row it no longer owns"
     assert row.output is None

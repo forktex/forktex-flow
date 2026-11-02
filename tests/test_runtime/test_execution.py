@@ -222,7 +222,7 @@ async def test_run_events_are_recorded_for_a_consumer_to_tail(flow: Flow):
 
     from sqlalchemy import text
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         rows = (
             await session.execute(
                 text(

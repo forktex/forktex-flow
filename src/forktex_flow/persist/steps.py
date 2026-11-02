@@ -102,7 +102,7 @@ async def upsert_pending_step(
         )
         .returning(StepRun.id, StepRun.status, StepRun.output, StepRun.skipped)
     )
-    async with store.session() as session:
+    async with store.transaction() as session:
         row = (await session.execute(statement)).one()
         return StepSlot(step_id=row.id, status=row.status, output=row.output, skipped=row.skipped)
 
@@ -114,7 +114,7 @@ async def mark_step_running(store: FlowStore, step_id: UUID) -> None:
     idempotent step body would run twice concurrently. Raises :class:`StepClaimLost` when the row was not
     ``pending`` — this executor lost the race and must abort without touching run/step state.
     """
-    async with store.session() as session:
+    async with store.transaction() as session:
         result = await session.execute(
             update(StepRun)
             .where(StepRun.id == step_id, StepRun.status == "pending")
@@ -133,7 +133,7 @@ async def heartbeat_step(store: FlowStore, step_id: UUID) -> bool:
     """Stamp the step alive. ``False`` when the row is no longer ``running`` — the claim is gone and the caller
     must stop stamping it.
     """
-    async with store.session() as session:
+    async with store.transaction() as session:
         result = await session.execute(
             update(StepRun).where(StepRun.id == step_id, StepRun.status == "running").values(heartbeat_at=sa.func.now())
         )
@@ -145,7 +145,7 @@ async def mark_step_completed(store: FlowStore, step_id: UUID, output: JsonValue
     ownership guard :func:`mark_step_failed` and :func:`mark_step_skipped` carry, so a worker whose claim lapsed
     cannot write an outcome over the one that took it.
     """
-    async with store.session() as session:
+    async with store.transaction() as session:
         result = await session.execute(
             update(StepRun)
             .where(StepRun.id == step_id, StepRun.status == "running")
@@ -181,7 +181,7 @@ async def mark_step_failed(
     }
     if final:
         values["finished_at"] = sa.func.now()
-    async with store.session() as session:
+    async with store.transaction() as session:
         result = await session.execute(
             update(StepRun)
             .where(StepRun.id == step_id, StepRun.status == "running")
@@ -203,7 +203,7 @@ async def mark_step_skipped(store: FlowStore, step_id: UUID) -> None:
     re-evaluate the guard against a state that has since moved on. Raises
     :class:`StepClaimLost` when the row is no longer ``running``.
     """
-    async with store.session() as session:
+    async with store.transaction() as session:
         result = await session.execute(
             update(StepRun)
             .where(StepRun.id == step_id, StepRun.status == "running")
@@ -221,7 +221,7 @@ async def mark_step_skipped(store: FlowStore, step_id: UUID) -> None:
 async def reclaim_stale_steps(store: FlowStore, stale_threshold: float) -> int:
     cutoff = sa.func.now() - timedelta(seconds=stale_threshold)
     note = sa.literal("\n[reclaimed: heartbeat stale]")
-    async with store.session() as session:
+    async with store.transaction() as session:
         result = await session.execute(
             update(StepRun)
             .where(
@@ -241,6 +241,6 @@ async def reclaim_stale_steps(store: FlowStore, stale_threshold: float) -> int:
 
 
 async def read_step_attempts(store: FlowStore, step_id: UUID) -> int:
-    async with store.session() as session:
+    async with store.transaction() as session:
         attempts = (await session.execute(select(StepRun.attempts).where(StepRun.id == step_id))).scalar_one()
         return attempts or 0

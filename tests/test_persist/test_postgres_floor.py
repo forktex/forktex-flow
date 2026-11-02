@@ -89,7 +89,7 @@ async def test_the_advertised_postgres_floor_runs_a_workflow() -> None:
         )
         await flow.init()
 
-        async with flow.session() as session:
+        async with flow.transaction() as session:
             server_major = int((await session.execute(sa.text("SHOW server_version"))).scalar_one().split(".")[0])
         assert server_major == floor, "the container is not the version the README advertises"
 

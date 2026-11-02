@@ -248,7 +248,7 @@ async def test_a_cancelled_run_does_not_report_itself_completed(postgres_url_str
         await execute_run(runtime, instance.instance_id, "cancel.report", 1)
 
         final = await flow.get(instance.instance_id)
-        async with flow.session() as session:
+        async with flow.transaction() as session:
             rows = await session.execute(
                 sa.text(f'SELECT event_type FROM "{flow.schema}".run_event WHERE run_id = :r'),  # noqa: S608
                 {"r": instance.instance_id},

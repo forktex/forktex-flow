@@ -114,7 +114,7 @@ async def test_the_keyset_predicate_is_an_index_cond_not_a_filter(flow: Flow):
     assert cursor is not None
 
     boundary = first.items[0]
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         plan = (
             await session.execute(
                 text(

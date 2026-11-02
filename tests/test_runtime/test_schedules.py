@@ -77,7 +77,7 @@ async def test_a_due_schedule_fires_exactly_once_under_two_competing_drivers(flo
     first, second = _driver(flow), _driver(flow)
     await first._fire_due_schedules()  # creates the row, fires nothing yet
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         assert (await session.execute(select(Run).where(Run.workflow_name == "t.cron"))).first() is None
         await session.execute(
             update(ScheduledRun)
@@ -88,7 +88,7 @@ async def test_a_due_schedule_fires_exactly_once_under_two_competing_drivers(flo
     # Two leaders, same due row, at the same moment.
     await asyncio.gather(first._fire_due_schedules(), second._fire_due_schedules())
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         runs = (await session.execute(select(Run).where(Run.workflow_name == "t.cron"))).scalars().all()
 
     assert len(runs) == 1, f"a due schedule fired {len(runs)} times; exactly one worker may win the claim"
@@ -108,7 +108,7 @@ async def test_a_fired_schedule_advances_past_now_rather_than_backlogging(flow: 
     driver = _driver(flow)
     await driver._fire_due_schedules()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(
             update(ScheduledRun)
             .where(ScheduledRun.workflow_name == "t.behind")
@@ -117,7 +117,7 @@ async def test_a_fired_schedule_advances_past_now_rather_than_backlogging(flow: 
 
     await driver._fire_due_schedules()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.behind"))).scalar_one()
         runs = (await session.execute(select(Run).where(Run.workflow_name == "t.behind"))).scalars().all()
 
@@ -133,7 +133,7 @@ async def test_a_schedule_row_is_created_for_a_registered_cron_workflow(flow: Fl
     flow.scheduled("t.registered", version=2, cron="0 3 * * *", state=LoggingState)(body)
     await _driver(flow)._fire_due_schedules()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (
             await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.registered"))
         ).scalar_one()
@@ -159,7 +159,7 @@ async def test_editing_a_cron_in_code_updates_the_stored_schedule(flow: Flow):
     revised.scheduled("t.changing", version=1, cron="30 4 * * *", state=LoggingState)(body)
     await _driver(revised)._fire_due_schedules()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (
             await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.changing"))
         ).scalar_one()
@@ -187,7 +187,7 @@ async def test_a_schedule_registered_disabled_gets_a_row_and_does_not_fire(flow:
     await driver._fire_due_schedules()
     await driver._fire_due_schedules()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (
             await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.disarmed"))
         ).scalar_one()
@@ -213,7 +213,7 @@ async def test_arming_a_schedule_survives_re_registration(flow: Flow):
     flow.scheduled("t.armed", version=1, cron="0 1 * * *", state=LoggingState, enabled=False)(body)
     await _driver(flow)._fire_due_schedules()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(update(ScheduledRun).where(ScheduledRun.workflow_name == "t.armed").values(enabled=True))
 
     # A fresh process registering the same workflow — still declaring it
@@ -222,7 +222,7 @@ async def test_arming_a_schedule_survives_re_registration(flow: Flow):
     revised.scheduled("t.armed", version=1, cron="0 2 * * *", state=LoggingState, enabled=False)(body)
     await _driver(revised)._fire_due_schedules()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.armed"))).scalar_one()
 
     assert row.enabled is True, "re-registration disarmed a schedule an operator had armed"
@@ -245,7 +245,7 @@ async def test_a_schedule_is_not_consumed_when_its_run_cannot_be_inserted(
     driver = _driver(flow)
     await driver._ensure_schedule_rows(flow._registry.scheduled(), iso.now())
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(
             update(ScheduledRun)
             .where(ScheduledRun.workflow_name == "cron.atomic")
@@ -259,7 +259,7 @@ async def test_a_schedule_is_not_consumed_when_its_run_cannot_be_inserted(
     with contextlib.suppress(Exception):
         await driver._fire_due_schedules()
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (
             await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "cron.atomic"))
         ).scalar_one()

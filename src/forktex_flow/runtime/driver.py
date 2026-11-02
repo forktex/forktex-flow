@@ -191,7 +191,7 @@ class Driver:
                 logger.exception("scheduled run submit failed for %s v%d", row.workflow_name, row.workflow_version)
 
     async def _has_schedule_rows(self) -> bool:
-        async with self.runtime.store.session() as session:
+        async with self.runtime.store.transaction() as session:
             return (await session.execute(select(ScheduledRun.workflow_name).limit(1))).first() is not None
 
     async def _ensure_schedule_rows(self, definitions: list[WorkflowDefinition], now: datetime) -> None:
@@ -201,7 +201,7 @@ class Driver:
         """
         if not definitions:
             return
-        async with self.runtime.store.session() as session:
+        async with self.runtime.store.transaction() as session:
             for defn in definitions:
                 cron = defn.schedule
                 if cron is None:
@@ -238,7 +238,7 @@ class Driver:
                 )
 
     async def _due_schedules(self, now: datetime) -> list[ScheduledRun]:
-        async with self.runtime.store.session() as session:
+        async with self.runtime.store.transaction() as session:
             rows = (
                 await session.execute(
                     select(ScheduledRun).where(
@@ -268,7 +268,7 @@ class Driver:
             .returning(ScheduledRun.workflow_name)
             .execution_options(synchronize_session=False)
         )
-        async with self.runtime.store.session() as session:
+        async with self.runtime.store.transaction() as session:
             if (await session.execute(statement)).first() is None:
                 return False
             await _runs.insert_run_in(
@@ -299,7 +299,7 @@ class Driver:
             sa.func.make_interval(0, 0, 0, 0, 0, 0, self.runtime.config.stale_threshold),
             sa.Interval,
         )
-        async with self.runtime.store.session() as session:
+        async with self.runtime.store.transaction() as session:
             result = await session.execute(
                 update(Run)
                 .where(

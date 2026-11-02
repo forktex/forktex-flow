@@ -83,7 +83,7 @@ async def _schedule_retry(flow: Flow, run_id, *, seconds: int) -> None:
     step_id = slot.step_id
     await _steps.mark_step_running(flow._store, step_id)
     await _steps.mark_step_failed(flow._store, step_id, "boom", final=False, retry_in_seconds=seconds)
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(sa.update(Run).where(Run.id == run_id).values(status="pending"))
 
 
@@ -109,7 +109,7 @@ async def test_it_is_claimed_once_the_backoff_has_elapsed(flow: Flow):
     await _schedule_retry(flow, instance.instance_id, seconds=60)
 
     # Reach back in time rather than sleeping for a minute.
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(
             sa.update(StepRun)
             .where(StepRun.run_id == instance.instance_id)
@@ -155,7 +155,7 @@ async def test_a_run_between_steps_is_still_claimed(flow: Flow):
     step_id = slot.step_id
     await _steps.mark_step_running(flow._store, step_id)
     await _steps.mark_step_completed(flow._store, step_id, {})
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(sa.update(Run).where(Run.id == instance.instance_id).values(status="pending"))
 
     claimed = await _runs.claim_pending_runs(flow._store, limit=10)

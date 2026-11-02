@@ -325,7 +325,7 @@ async with isolated_flow(postgres_url) as flow:
 
 ### 13. Reading the engine's own tables
 
-`flow.session()` is public — tailing `run_event` for a progress stream needs no
+`flow.transaction()` is public — tailing `run_event` for a progress stream needs no
 second pool. `flow.schema` and `flow.engine` are there for DDL, advisory locks
 and migrations. The engine owns the transaction, so `commit()` raises.
 

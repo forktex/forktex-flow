@@ -165,7 +165,7 @@ async def test_the_database_accepts_exactly_the_statuses_the_type_declares(flow:
     """
     declared = set(get_args(RunStatus))
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(insert(Workflow).values(name="t.statuses", version=1, registered_at=iso.now()))
         for status in declared:
             await session.execute(
@@ -175,7 +175,7 @@ async def test_the_database_accepts_exactly_the_statuses_the_type_declares(flow:
             )
 
         with pytest.raises(DBAPIError):
-            async with flow.session() as rejecting:
+            async with flow.transaction() as rejecting:
                 await rejecting.execute(
                     insert(Run).values(
                         workflow_name="t.statuses",
@@ -196,7 +196,7 @@ async def test_a_replayed_step_whose_output_was_the_old_skip_marker_keeps_it(flo
     """
     collides: dict[str, JsonValue] = {"__skipped__": True}
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(insert(Workflow).values(name="t.marker", version=1, registered_at=iso.now()))
     run_id = await _runs.insert_run(flow._store, workflow_name="t.marker", workflow_version=1, input={}, metadata={})
 
@@ -234,12 +234,12 @@ async def test_a_step_cannot_be_skipped_without_being_completed(flow: Flow) -> N
     cannot interpret. Only one caller writes the column and it always writes
     `completed` too, which made the invariant a convention rather than a rule.
     """
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         await session.execute(insert(Workflow).values(name="t.ck", version=1, registered_at=iso.now()))
     run_id = await _runs.insert_run(flow._store, workflow_name="t.ck", workflow_version=1, input={}, metadata={})
 
     with pytest.raises(DBAPIError, match="ck_step_run_skipped_is_completed"):
-        async with flow.session() as session:
+        async with flow.transaction() as session:
             await session.execute(
                 insert(StepRun).values(
                     run_id=run_id,

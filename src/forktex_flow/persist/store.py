@@ -47,12 +47,12 @@ class FlowStore:
     database: Database
     schema: str
 
-    def session(self) -> AbstractAsyncContextManager[AsyncSession]:
+    def transaction(self) -> AbstractAsyncContextManager[AsyncSession]:
         """One transaction per block: commits on clean exit, rolls back on error. Callers do not commit —
-        ``transactional_session`` owns the boundary and raises ``TransactionBoundaryError`` on
+        the block owns the boundary and raises ``TransactionBoundaryError`` on
         ``commit``/``rollback``/``begin``, so a write-without-commit cannot be introduced.
         """
-        return self.database.transactional_session()
+        return self.database.transaction()
 
     @property
     def engine(self) -> AsyncEngine:

@@ -23,7 +23,7 @@
 
 [project]
 name = "forktex-flow"
-version = "0.4.0"
+version = "0.5.0"
 description = "Postgres-native durable workflow execution — pipelines and cron-scheduled runs, built on the forktex substrate."
 authors = [
     {name = "FORKTEX",email = "info@forktex.com"}
@@ -63,7 +63,7 @@ classifiers = [
 #
 # Note that `forktex` pulls redis in unconditionally; nothing here uses it.
 dependencies = [
-    "forktex>=0.14,<0.15",
+    "forktex>=0.15,<0.16",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.31",
     "pydantic>=2.0",
