@@ -32,9 +32,16 @@ migration runner, so nothing is mocked and nothing is shared.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Callable, AsyncIterator, Iterator
+
+import asyncio
+import operator
+from typing import Annotated, TypedDict
 
 import pytest
+from forktex_flow import RuntimeConfig
+from forktex_flow.runtime.context import FlowRuntime
+from forktex_flow.runtime.driver import Driver
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.engine import URL
@@ -71,3 +78,31 @@ async def flow(postgres_url_str: str) -> AsyncIterator[Flow]:
         async with instance.engine.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await instance.close()
+
+
+async def until(predicate: Callable[[], bool], *, timeout: float = 10.0, interval: float = 0.02) -> None:
+    """Wait for a condition instead of sleeping a guessed interval.
+
+    A fixed sleep either slows every run or, on a loaded container, lets the
+    test proceed before the thing it is about to assert on has happened.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"condition still false after {timeout}s")
+        await asyncio.sleep(interval)
+
+
+class LoggingState(TypedDict, total=False):
+    """The state most tests use: one reducer-merged list."""
+
+    logs: Annotated[list[str], operator.add]
+
+
+def runtime_for(flow: Flow, config: RuntimeConfig | None = None) -> FlowRuntime:
+    """The runtime the driver would build, without starting the driver."""
+    return FlowRuntime(flow._store, flow._registry, config or flow._config, flow.extensions)
+
+
+def driver_for(flow: Flow, config: RuntimeConfig | None = None) -> Driver:
+    return Driver(runtime_for(flow, config))

@@ -21,13 +21,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""``FlowRuntime`` — everything the executor and the driver need to do their job.
-
-The counterpart to :class:`FlowStore` one layer up. ``persist`` and ``read`` need
-a pool and a schema; ``runtime`` additionally needs to know what is registered,
-how hard to retry, and who is listening. Bundling the four means the executor
-takes one parameter instead of four, without taking the facade.
-"""
 
 from __future__ import annotations
 
@@ -45,8 +38,6 @@ __all__ = ["FlowRuntime"]
 
 @dataclass(frozen=True, slots=True)
 class FlowRuntime:
-    """The execution context: where to write, what is declared, how to behave."""
-
     store: FlowStore
     registry: FlowRegistry
     config: RuntimeConfig

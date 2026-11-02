@@ -51,6 +51,14 @@ async def test_init_is_idempotent(flow: Flow):
     await flow.init()
     await flow.init()
 
+    async with flow.engine.connect() as conn:
+        applied = (
+            await conn.execute(
+                sa.text(f'SELECT count(*), count(DISTINCT version) FROM "{flow.schema}".flow_schema_version')
+            )
+        ).one()
+    assert applied[0] == applied[1], "the second init() recorded a duplicate version row"
+
 
 @pytest.mark.asyncio
 async def test_the_version_table_keeps_its_deployed_name(flow: Flow):

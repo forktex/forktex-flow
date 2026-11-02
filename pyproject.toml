@@ -23,7 +23,7 @@
 
 [project]
 name = "forktex-flow"
-version = "0.2.1"
+version = "0.5.0"
 description = "Postgres-native durable workflow execution — pipelines and cron-scheduled runs, built on the forktex substrate."
 authors = [
     {name = "FORKTEX",email = "info@forktex.com"}
@@ -63,7 +63,7 @@ classifiers = [
 #
 # Note that `forktex` pulls redis in unconditionally; nothing here uses it.
 dependencies = [
-    "forktex>=0.11,<1",
+    "forktex>=0.15,<0.16",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.31",
     "pydantic>=2.0",
@@ -111,6 +111,8 @@ dev = [
     "build>=1.2.0",
     "twine>=5.0.0",
     "testcontainers[postgres]>=4.0",
+    "alembic (>=1.14)",
+    "pytest-timeout (>=2.3)",
 ]
 
 [tool.ruff]
@@ -138,6 +140,10 @@ typeCheckingMode = "basic"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# A durability suite waits on work that a defect simply never finishes, and an
+# unbounded wait reports that as a hung run rather than a failure.
+timeout = 120
+timeout_method = "thread"
 testpaths = ["tests"]
 norecursedirs = [".venv", "dist", "build"]
 log_cli = false

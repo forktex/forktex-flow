@@ -21,47 +21,21 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""``RunFilter`` — what a caller is asking for, without any SQL.
-
-Extracted so the read layer compiles a value object instead of reaching into a
-query builder's private attributes, and so the same filter set can be applied to
-the page query, the count and the summary. It previously could not be: each of
-the three built its own ``where`` list, and the summary's list was missing the
-metadata, state and current-node filters — so ``.metadata(k=v).summary()``
-silently aggregated over every run in the table.
-"""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
-from forktex.types import BaseValueObject
+from forktex.types import BaseValueObject, JsonObject
 from pydantic import Field
 
 
 class RunFilter(BaseValueObject):
-    """The predicate half of a run query. Frozen, and free of I/O.
-
-    Every field is optional; an empty ``RunFilter`` matches every run.
-
-    Attributes:
-        workflow_name:    Exact match on the workflow's name.
-        workflow_version: Exact match on its version. Only meaningful with a name.
-        statuses:         Any-of match on run status.
-        metadata_filter:  JSONB containment against ``run.metadata``.
-        state_filter:     JSONB containment against ``run.input``.
-        current_nodes:    Runs whose currently-running step is one of these.
-        since:            ``started_at >= since``.
-        until:            ``started_at < until``.
-        triggered_by:     Any-of match on the trigger label.
-    """
-
     workflow_name: str | None = None
     workflow_version: int | None = None
     statuses: tuple[str, ...] = ()
-    metadata_filter: dict[str, Any] = Field(default_factory=dict)
-    state_filter: dict[str, Any] = Field(default_factory=dict)
+    metadata_filter: JsonObject = Field(default_factory=dict)
+    state_filter: JsonObject = Field(default_factory=dict)
     current_nodes: tuple[str, ...] = ()
     since: datetime | None = None
     until: datetime | None = None

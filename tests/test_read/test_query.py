@@ -64,6 +64,10 @@ async def test_a_query_filters_by_workflow_and_status(flow: Flow):
 
 @pytest.mark.asyncio
 async def test_metadata_containment_filters(flow: Flow):
+    """Containment, not equality: `{"org_id": "acme"}` matches a run whose
+    metadata holds that pair among others, and the unmatched keys come back
+    with it.
+    """
     await _register(flow)
     await flow.run("t.query", state={}, metadata={"org_id": "acme", "kind": "deploy"})
     await flow.run("t.query", state={}, metadata={"org_id": "other"})
@@ -110,7 +114,7 @@ async def test_the_keyset_predicate_is_an_index_cond_not_a_filter(flow: Flow):
     assert cursor is not None
 
     boundary = first.items[0]
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         plan = (
             await session.execute(
                 text(

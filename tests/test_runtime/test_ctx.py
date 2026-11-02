@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import operator
+import asyncio
 import uuid
 from typing import Annotated, TypedDict
 
@@ -81,7 +82,9 @@ async def test_sleep_is_available_and_does_not_need_a_store():
         attempt=1,
         metadata={},
     )
-    await ctx.sleep(0.001)
+    started = asyncio.get_running_loop().time()
+    await ctx.sleep(0.01)
+    assert asyncio.get_running_loop().time() - started >= 0.01, "sleep returned without sleeping"
 
 
 @pytest.mark.asyncio
@@ -150,7 +153,7 @@ async def test_emit_from_inside_a_step_lands_in_the_event_log(flow: Flow):
         1,
     )
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         payloads = (
             (
                 await session.execute(

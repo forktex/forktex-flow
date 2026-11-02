@@ -22,9 +22,9 @@ imports everything and is imported only by `__init__.py`.
 
 **Why layered at 3,350 LOC**, when `package-layout:flat-until-cycles` says flat
 until cycle debt appears and this package's debt is zero. The debt is zero
-*because* of the layers. This is the package the rule's own evidence is drawn
+*from* the layers. This is the package the rule's own evidence is drawn
 from: flat at ~6,000 LOC it carried 59 deferred imports, and adopting the layered
-DAG is what took it to zero. Flattening 28 modules back into one directory would
+DAG is what took it to zero. Flattening 29 modules back into one directory would
 re-run that experiment, and it would delete `test_layering.py` — the level-DAG
 guard `concept.forktex-substrate` calls the highest-value gap in the corpus, and
 the only place it exists. Recorded as a deliberate deviation rather than left to
@@ -41,6 +41,7 @@ make install     # poetry install --with dev
 make test        # pytest + coverage floor
 make lint        # ruff check
 make typecheck   # pyright, src/ only
+make lock-check  # poetry.lock matches pyproject.toml
 make release-check  # version, CHANGELOG and (with TAG=) the git tag agree
 make ci          # the full gate; run this before proposing a change is done
 ```
@@ -72,18 +73,33 @@ running**. There are no mocks for it.
 boundaries, page and cursor shapes, keyset predicates, generic CRUD, DDL
 constructs, reflection, identifier validation, integrity translation, advisory
 locks, model mixins and the SQL migration runner. Writing any of them again is
-the bug, not a style choice. This package consumes `Database`, `substrate_base`,
-`SchemaMigrationRunner`, `advisory_key`, `try_advisory_lock`, `Page`,
-`encode_cursor`/`decode_cursor`, `ddl`, `reflect` and `validate_identifier`.
+the bug, not a style choice.
+
+This package consumes `Database`, `substrate_base`, `SchemaMigrationRunner`,
+`advisory_key`, `try_advisory_lock`, `Page` and `encode_cursor`/`decode_cursor`.
+`reflect` is used by the tests only.
 
 ## Adding a migration
 
-1. Write `src/forktex_flow/persist/migrations/v000N__description.sql`. The runner
+The baseline is **one file per table** — `v0001__workflow` through
+`v0005__scheduled_run` — each the table's complete and final definition. They
+apply in foreign-key dependency order, which the runner's numeric ordering is
+what guarantees: `workflow` before `run`, `run` before `step_run` and
+`run_event`, `workflow` before `scheduled_run`. Renumbering them breaks that.
+
+That shape covers the baseline only. A later change to an existing table is a
+new `v{NNNN}__{table}_{change}.sql`, not an edit to its baseline file.
+
+1. Write `src/forktex_flow/persist/migrations/v{NNNN}__{description}.sql`. The runner
    globs `v*.sql` and applies them in numeric order, so nothing registers it.
 2. Use `{schema}` where the schema name goes — a plain string replace, not
    `str.format`, so literal `{`/`}` in JSONB defaults are safe.
 3. Change `persist/models.py` in the same commit. `test_schema_drift.py` migrates
-   a real database and diffs its columns against the ORM, so the two cannot part.
+   a real database and compares it to the ORM with alembic's own comparator, so
+   a divergence in a type, a nullability, a server default, a constraint or an
+   index — not only a missing column — fails the gate. The models must declare
+   every index the SQL creates, by name and shape; `index=True` generates
+   `ix_{schema}_{table}_{column}`, which is not what the SQL is named.
 4. Add the new file's sha256 to `SHIPPED` in
    `tests/test_persist/test_migration_immutability.py`. That test tells you the
    hash when it fails.
@@ -91,6 +107,16 @@ the bug, not a style choice. This package consumes `Database`, `substrate_base`,
 **Never edit a migration that has shipped.** Databases that applied it will not
 re-run it, so they would describe a schema this code no longer expects. Fix a bad
 migration by writing the next one.
+
+`SHIPPED` freezes a migration as soon as it is listed, which is earlier than
+release — so a migration added and then refined within one unreleased cycle has
+to become the next file instead. By then a development database has applied it,
+and editing it in place diverges that database the way editing a released one
+diverges a consumer's.
+
+`forktex>=0.14` enforces the same rule from the other side: its runner records
+each applied migration's checksum and refuses a file whose content has changed,
+or a pending version numbered below the highest applied.
 
 ## Running a subset of tests
 
@@ -119,7 +145,7 @@ change is done.
 ## Known constraints
 
 - **`Flow.__init__` takes `**engine_kwargs`.** Anything unrecognised is forwarded
-  to `create_async_engine`, which means a future first-class constructor option
+  to `create_async_engine`, so a future first-class constructor option
   could collide with a keyword a consumer is already passing through. Narrowing
   it to an `engine_kwargs: dict` parameter would be a breaking change to a
   constructor consumers already call, so it stays — but add new options with the
@@ -139,48 +165,17 @@ change is done.
 - **The version table is `flow_schema_version`,** not `SchemaMigrationRunner`'s
   default of `schema_version`. Deployed databases carry the former; a runner
   looking for the latter finds no applied versions and re-runs v0001.
-- **`forktex` looks stuck at 0.2.4 on PyPI.** It is not — 0.11.0 is published.
-  pip silently hides a release whose `requires-python` floor your interpreter
-  does not meet, so any check run under 3.12 sees an older lineage and concludes
-  the dependency is unsatisfiable. Check with a 3.14 interpreter. This reached
-  the README once as a confident, false claim; `test_docs_accuracy.py` now
-  refuses it.
+- **`forktex` can look stuck at an old version on PyPI.** pip silently hides a
+  release whose `requires-python` floor your interpreter does not meet, so a
+  check run under 3.12 sees an older lineage and concludes the dependency is
+  unsatisfiable. Check with a 3.14 interpreter.
 - **`except A, B:` without parentheses** is PEP 758 and valid on 3.14. ruff's
-  formatter emits it under `target-version = "py314"`.
-
-## Consumers
-
-### ForkTex Cloud — the swap, when it happens
-
-Cloud runs against a stand-in (`api/src/shared/flow.py`, ~260 lines) that keeps this
-package's shape while `Flow.run()` raises and the HTTP layer renders 503. Replacing it
-is four edits, and they are written down here so the next cycle does not have to
-rediscover them:
-
-1. **`api/src/shared/flow.py` collapses to a re-export** —
-   `from forktex_flow import Ctx, Flow, FlowExtension, StepSpec, WorkflowInstance, step`.
-   `FlowUnavailableError` disappears with it: dispatch works, so nothing renders 503.
-2. **`api/src/deploy/flow_extension.py` — delete the `before_dispatch` override.** It is
-   dead code. The stand-in invented that hook; the real `FlowExtension` protocol has
-   `before_start`, `after_complete` and `after_fail`, and nothing else. Cloud's override
-   is a no-op that nothing would call.
-3. **`namespace` is gone from the surface.** `api/src/flow_api/schemas.py`'s
-   `FlowInstanceRead.namespace` and the `namespace=` line in `routes.py`'s
-   `_instance_model()` come out, then `make codegen` regenerates the SDK and client.
-   It only ever carried `metadata["__namespace__"]` from the config track, which this
-   package does not have.
-4. **`api/pyproject.toml` gains `forktex-flow`** — a poetry path dependency during
-   development, a version pin before publish.
-
-Unaffected, and worth stating because they look fragile: cloud's `Deployment.flow_run_id`
-(a plain UUID column, deliberately no FK across the schema boundary) and the raw-SQL
-`run_event` tail behind its SSE endpoint. Both are covered by this package's own tests.
-
-### Anything else
-
-`intelligence` and `network` both pin `forktex-core` 2.x, which no longer exists on PyPI.
-Neither can consume this package without first migrating off that lineage; treat them as
-migration projects, not as constraints on this one.
+  formatter emits it under `target-version = "py314"`. A system `python3` on
+  3.12 reports every one as a syntax error, so `make parse-check` runs first in
+  `make ci` and refuses to run below 3.14.
+- **`read/instance.py` holds behaviour, not just shapes.** `wait`/`stream`/
+  `cancel` live on `WorkflowInstance` rather than on `Flow` so the read layer
+  does not import the facade.
 
 ## Release
 
@@ -190,10 +185,10 @@ PyPI version is immutable, so a release whose own changes are documented as unre
 cannot be corrected afterwards — only superseded.
 
 **Pick one path.** Publishing twice is not an error you recover from; the second upload
-is rejected because the version already exists, and by then the first is public.
+is rejected: the version already exists, and by then the first is public.
 
 **Credentials.** Nothing is configured in this checkout — no `~/.pypirc`, no `TWINE_*`
-in the environment — so the first upload will otherwise stop at an interactive prompt.
+in the environment — without them the first upload stops at an interactive prompt.
 twine knows the `pypi` and `testpypi` repositories by name already; only the token is
 missing. Both indexes are separate accounts with separate tokens:
 

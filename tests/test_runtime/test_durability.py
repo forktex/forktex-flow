@@ -40,8 +40,10 @@ from sqlalchemy import select
 
 from forktex_flow import Ctx, Flow, step
 from forktex_flow.errors import WorkflowCancelled
+from forktex_flow.persist import runs as _runs
 from forktex_flow.persist.models import Run, StepRun
 from forktex_flow.runtime.context import FlowRuntime
+from forktex_flow.errors import StateNotSerialisable
 from forktex_flow.runtime.execution import _hash_state, execute_run
 
 
@@ -90,19 +92,28 @@ def test_the_same_instant_in_two_timezones_hashes_the_same():
     assert _hash_state({"when": instant}, ordinal=0) == _hash_state({"when": elsewhere}, ordinal=0)
 
 
-def test_dates_uuids_and_unknown_objects_all_hash_without_raising():
-    """State crosses JSONB, so the hash has to cope with whatever a step put
-    there. Failing to serialise here would fail the run, not the hash."""
+def test_dates_and_uuids_hash_without_raising():
+    """The values a step legitimately carries. Temporal values go through `iso`
+    so the same instant written at two offsets hashes the same."""
+    digest = _hash_state({"day": date(2026, 8, 30), "ident": uuid.uuid7()}, ordinal=0)
+    assert len(digest) == 64
+
+
+def test_a_value_jsonb_cannot_take_is_refused_by_name():
+    """This read as "the hash must cope with whatever a step put there, because
+    raising would fail the run". The run fails either way — the state write
+    rejects the value a moment later — so the only question was whether anything
+    said why. Meanwhile `str(value)` on an object without its own `__str__`
+    yields a heap address, and the same state then hashed differently in the
+    next process, so a completed step re-executed.
+    """
 
     class Opaque:
         def __repr__(self) -> str:
             return "<opaque>"
 
-    digest = _hash_state(
-        {"day": date(2026, 8, 30), "ident": uuid.uuid7(), "other": Opaque()},
-        ordinal=0,
-    )
-    assert len(digest) == 64
+    with pytest.raises(StateNotSerialisable, match="Opaque"):
+        _hash_state({"other": Opaque()}, ordinal=0)
 
 
 # ── retries ──────────────────────────────────────────────────────────────
@@ -145,7 +156,7 @@ async def test_a_retry_schedules_the_next_attempt_rather_than_spinning(flow: Flo
     instance = await flow.run("t.backoff", state={})
     await execute_run(_runtime(flow), instance.instance_id, "t.backoff", 1)
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(StepRun).where(StepRun.run_id == instance.instance_id))).scalar_one()
 
     assert row.status == "pending", "a retryable failure returns the step to pending"
@@ -193,7 +204,7 @@ async def test_a_step_raising_workflow_cancelled_cancels_the_run(flow: Flow):
     assert final.nodes[0].status == "failed", "the step records that it did not complete"
 
     # The reason reaches the row an operator reads, not just the log.
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         reason = (await session.execute(select(Run.cancel_reason).where(Run.id == instance.instance_id))).scalar_one()
     assert "target was deleted" in reason
 
@@ -249,7 +260,7 @@ async def test_a_long_step_heartbeats_while_it_runs(flow: Flow, postgres_url_str
         instance = await fast.run("t.heartbeat", state={})
         await execute_run(_runtime(fast), instance.instance_id, "t.heartbeat", 1)
 
-        async with fast.session() as session:
+        async with fast.transaction() as session:
             row = (await session.execute(select(StepRun).where(StepRun.run_id == instance.instance_id))).scalar_one()
 
         assert row.status == "completed"
@@ -286,7 +297,7 @@ async def test_a_configured_default_reaches_an_undecorated_step(flow: Flow, post
         instance = await tuned.run("t.defaults", state={})
         await execute_run(_runtime(tuned), instance.instance_id, "t.defaults", 1)
 
-        async with tuned.session() as session:
+        async with tuned.transaction() as session:
             row = (await session.execute(select(StepRun).where(StepRun.run_id == instance.instance_id))).scalar_one()
 
         assert row.max_attempts == 7, "the configured default did not reach the step"
@@ -323,7 +334,7 @@ async def test_cancelling_a_running_run_is_not_reverted_by_the_executor(flow: Fl
     instance = await flow.run("t.cancelrace", state={"logs": []})
 
     task = asyncio.create_task(execute_run(_runtime(flow), instance.instance_id, "t.cancelrace", 1))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=20)  # a step that never starts must fail, not hang
     assert await instance.cancel() is True
     await task
 
@@ -331,7 +342,7 @@ async def test_cancelling_a_running_run_is_not_reverted_by_the_executor(flow: Fl
     assert final.status == "cancelled", "the executor overwrote the cancellation"
     assert "should never run" not in final.state.get("logs", []), "a step ran after cancellation"
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(Run).where(Run.id == instance.instance_id))).scalar_one()
     assert row.cancel_reason == "cancelled by operator"
     assert row.cancelled_at is not None
@@ -355,7 +366,7 @@ async def test_the_step_already_running_is_allowed_to_finish(flow: Flow):
     instance = await flow.run("t.midstep", state={"logs": []})
 
     task = asyncio.create_task(execute_run(_runtime(flow), instance.instance_id, "t.midstep", 1))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), timeout=20)  # a step that never starts must fail, not hang
     await instance.cancel()
     await task
 
@@ -379,6 +390,29 @@ async def test_cancelling_an_already_finished_run_changes_nothing(flow: Flow):
 
     final = await flow.get(instance.instance_id)
     assert final.status == "completed"
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         row = (await session.execute(select(Run).where(Run.id == instance.instance_id))).scalar_one()
     assert row.cancel_reason is None, "a declined cancel must not stamp a reason"
+
+
+@pytest.mark.asyncio
+async def test_a_step_finishing_after_a_cancel_does_not_overwrite_the_output(flow: Flow) -> None:
+    """`update_run_output` had no terminal guard, so the step that was already
+    running when an operator cancelled wrote its state over the cancelled run's
+    output — leaving `status='cancelled'` beside a successful-looking result."""
+
+    async def only(ctx: Ctx, state: dict) -> dict:
+        return {}
+
+    flow.pipeline("late.write", version=1)(type("W", (), {"steps": [only]}))
+    instance = await flow.run("late.write", version=1)
+    run_id = instance.instance_id
+
+    await _runs.update_run_status(flow._store, run_id, status="cancelled", error="by operator")
+    await _runs.update_run_output(flow._store, run_id, {"looks": "successful"})
+
+    async with flow.transaction() as session:
+        row = (await session.execute(select(Run).where(Run.id == run_id))).scalar_one()
+
+    assert row.status == "cancelled"
+    assert row.output != {"looks": "successful"}, "a terminal run's output was overwritten"

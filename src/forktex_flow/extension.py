@@ -21,26 +21,15 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""``FlowExtension`` — the hook protocol a consumer implements to observe runs.
-
-Three moments: before a run is inserted, and after it reaches each of its two
-terminal states. That is the whole contract, and it is a `Protocol` rather than a
-base class, so a consumer writes a plain object with the one or two methods it
-cares about and passes it in.
-
-The library ships this file and no concrete extension. Every consumer's tenant
-model is its own — a ContextVar, a request-scoped dependency, something else —
-and a resolver here would be one product's preferences leaking into all of them.
-"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     # Typing-only, so `extension` stays importable without pulling the engine's
     # module graph in behind it.
-    from forktex.types import JsonValue
+    from forktex.types import JsonObject, JsonValue
 
     from forktex_flow.domain.types import RunInfo
 
@@ -49,29 +38,17 @@ __all__ = ["FlowExtension"]
 
 @runtime_checkable
 class FlowExtension(Protocol):
-    """Hooks the library calls at well-defined points in a run's life.
-
-    Every method is optional: implement the ones you need and omit the rest.
-    Hooks are awaited, so work inside them completes before the run is
-    considered finished. A hook that raises is logged and swallowed — an
-    extension observes a run, it does not get to change its outcome.
+    """Hooks the library calls at well-defined points in a run's life. A hook that raises is logged and swallowed —
+    an extension observes a run, it does not get to change its outcome.
     """
 
     async def before_start(
         self,
         name: str,
         version: int,
-        input: dict[str, Any],
-        metadata: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Augment a run's metadata before its row is inserted.
-
-        Return a dict merged into ``metadata``; return ``{}`` to add nothing.
-        This is where a consumer stamps request context onto a run —
-        ``{"org_id": current_org.get(), "trace_id": current_trace.get()}`` —
-        which then reaches every step through ``Ctx.metadata`` and is queryable
-        through ``flow.query().metadata(org_id=…)``.
-        """
+        input: JsonObject,
+        metadata: JsonObject,
+    ) -> JsonObject:
         return {}
 
     async def after_complete(self, run: RunInfo, output: JsonValue) -> None:

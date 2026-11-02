@@ -44,6 +44,7 @@ ROOT_SURFACE = {
     "TERMINAL_STATUSES",
     "Ctx",
     "Flow",
+    "FlowClosed",
     "FlowError",
     "FlowExtension",
     "InstancePage",
@@ -53,6 +54,7 @@ ROOT_SURFACE = {
     "RunStatus",
     "RunSummary",
     "RuntimeConfig",
+    "StateNotSerialisable",
     "StepFailed",
     "StepRunInfo",
     "StepSpec",
@@ -132,4 +134,4 @@ def test_the_migrations_are_packaged_as_data():
     with no tables. Assert they are where the runner looks."""
     migrations = sorted((SRC / "persist" / "migrations").glob("v*.sql"))
     assert migrations, "no v*.sql migrations found"
-    assert migrations[0].name == "v0001__schema.sql"
+    assert migrations[0].name.startswith("v0001__"), f"the baseline does not start at v0001: {migrations[0].name}"

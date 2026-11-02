@@ -33,8 +33,14 @@ from __future__ import annotations
 import operator
 from typing import Annotated, TypedDict
 
+import uuid
+
+from datetime import UTC, datetime
+
 import pytest
 
+from forktex_flow.errors import StateNotSerialisable
+from forktex_flow.runtime.execution import _hash_state
 from forktex_flow import Ctx, Flow, step
 from forktex_flow.runtime.context import FlowRuntime
 from forktex_flow.runtime.execution import execute_run
@@ -216,7 +222,7 @@ async def test_run_events_are_recorded_for_a_consumer_to_tail(flow: Flow):
 
     from sqlalchemy import text
 
-    async with flow.session() as session:
+    async with flow.transaction() as session:
         rows = (
             await session.execute(
                 text(
@@ -251,3 +257,25 @@ async def test_a_failing_step_body_does_not_lose_the_run(flow: Flow):
     assert final.status == "failed"
     assert final.nodes[0].status == "failed"
     assert "kaboom" in (final.nodes[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_state_carrying_an_unserialisable_value_is_refused(flow: Flow) -> None:
+    """The hash fell back to `str(value)` for anything JSON could not take, and
+    an object without its own `__str__` renders as `<Class object at 0x...>` — a
+    heap address. The same state then hashed differently in the next process, so
+    a completed step was not found on resume and ran a second time.
+    """
+
+    class Opaque:
+        pass
+
+    with pytest.raises(StateNotSerialisable, match="Opaque"):
+        _hash_state({"client": Opaque()}, ordinal=0)  # type: ignore[dict-item]
+
+
+def test_the_same_state_hashes_the_same_in_a_fresh_process() -> None:
+    """The memoisation key has to survive a restart, which is the whole point of
+    it being stored."""
+    state = {"when": datetime(2026, 1, 1, tzinfo=UTC), "id": uuid.uuid7(), "n": 3}
+    assert _hash_state(state, ordinal=0) == _hash_state(dict(reversed(list(state.items()))), ordinal=0)

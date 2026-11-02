@@ -21,26 +21,20 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""The row shapes the read layer returns.
-
-``BaseWireValueObject`` — frozen, and camelCase on the wire — because consumers
-serialise these straight out of an HTTP route with ``model_dump()``. The typed
-shape is the contract, so changing a field here changes someone's JSON.
-"""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Literal
 from uuid import UUID
 
-from forktex.types import BaseWireValueObject, JsonValue
+from forktex.types import BaseValueObject, BaseWireValueObject, JsonObject, JsonValue
 from pydantic import Field
 
 #: Runs and steps share one status vocabulary — a step is a run's work in
 #: miniature, and two lists that must stay identical are one list. Both names
 #: are exported so a signature can say which it means; the CHECK constraints in
-#: `v0001__schema.sql` are what actually enforce the values.
+#: the migrations are what actually enforce the values.
 RunStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
 StepStatus = RunStatus
 
@@ -48,10 +42,11 @@ StepStatus = RunStatus
 #: Polling and streaming stop here.
 TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 
+#: The extension hooks dispatched by name once a run reaches a terminal status.
+TerminalHook = Literal["after_complete", "after_fail"]
+
 
 class StepRunInfo(BaseWireValueObject):
-    """One step invocation within a run."""
-
     step_id: UUID
     step_name: str
     step_index: int
@@ -64,28 +59,40 @@ class StepRunInfo(BaseWireValueObject):
     heartbeat_at: datetime | None
 
 
-class RunInfo(BaseWireValueObject):
-    """Full state of a workflow run, including per-step progress."""
+class RunClaim(BaseValueObject):
+    run_id: UUID
+    workflow_name: str
+    workflow_version: int
 
+
+class StepSlot(BaseValueObject):
+    """The row for one step invocation, and whatever it already recorded. ``status == "completed"`` is the
+    memoisation hit: ``output`` is the cached delta and the body must not run again.
+    """
+
+    step_id: UUID
+    status: StepStatus
+    output: JsonValue
+    skipped: bool = False
+
+
+class RunInfo(BaseWireValueObject):
     run_id: UUID
     workflow_name: str
     workflow_version: int
     status: RunStatus
-    input: dict[str, Any]
-    output: dict[str, Any] | None
+    input: JsonObject
+    output: JsonObject | None
     error: str | None
-    metadata: dict[str, Any]
+    metadata: JsonObject
     started_at: datetime
     finished_at: datetime | None
     steps: list[StepRunInfo] = Field(default_factory=list)
 
 
 class RunSummary(BaseWireValueObject):
-    """Aggregate statistics over a matching set of runs.
-
-    ``p95_duration_seconds`` is the worst per-status p95, not a true global one —
-    computing that needs an ungrouped pass. Stated because the name suggests
-    otherwise.
+    """Aggregate statistics over a matching set of runs. ``p95_duration_seconds`` is the worst per-status p95, not
+    a true global one — computing that needs an ungrouped pass, which the name does not suggest.
     """
 
     total: int
@@ -98,9 +105,12 @@ class RunSummary(BaseWireValueObject):
 
 __all__ = [
     "TERMINAL_STATUSES",
+    "RunClaim",
     "RunInfo",
     "RunStatus",
     "RunSummary",
     "StepRunInfo",
+    "StepSlot",
     "StepStatus",
+    "TerminalHook",
 ]

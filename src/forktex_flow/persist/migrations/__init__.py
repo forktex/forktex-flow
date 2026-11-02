@@ -21,16 +21,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Bring the ``forktex_flow`` schema up to date.
-
-Each ``v{NNNN}__{description}.sql`` file in this directory carries one
-migration. Forward-only: a bad migration is fixed by the next version, never by
-a downgrade — the same convention DBOS, Loki and Sentry follow.
-
-The walking, ordering, advisory locking and version bookkeeping are
-:class:`forktex.database.SchemaMigrationRunner`'s, not ours; its docstring names
-``forktex_flow`` as its worked example. All this module adds is the two
-flow-specific arguments.
+"""Bring the ``forktex_flow`` schema up to date. Forward-only: a bad migration is fixed by the next version, never
+by a downgrade — the same convention DBOS, Loki and Sentry follow.
 """
 
 from __future__ import annotations
@@ -53,12 +45,8 @@ _VERSION_TABLE = "flow_schema_version"
 
 
 async def apply_migrations(engine: AsyncEngine, schema: str = "forktex_flow") -> None:
-    """Apply every unapplied migration for ``schema``.
-
-    Idempotent and safe to call from every worker on startup — concurrent
-    callers serialise on an advisory lock, the first applies and the rest skip.
-    ``Flow.init()`` calls this; call it directly when a consumer drives its own
-    migration pipeline.
+    """Apply every unapplied migration for ``schema``. Idempotent and safe to call from every worker on startup —
+    concurrent callers serialise on an advisory lock, the first applies and the rest skip.
     """
     await SchemaMigrationRunner(
         engine,

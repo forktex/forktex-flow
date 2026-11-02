@@ -35,27 +35,18 @@ one leader, one execution per step, one row per memoisation key.
 from __future__ import annotations
 
 import asyncio
-import operator
-from typing import Annotated, TypedDict
 
 import pytest
-from sqlalchemy import func, select
+
+from tests.conftest import LoggingState, runtime_for
+from sqlalchemy import func, select, update
 
 from forktex_flow import Ctx, Flow, RuntimeConfig
 from forktex_flow.errors import StepClaimLost
 from forktex_flow.persist import steps as _steps
 from forktex_flow.persist.models import StepRun
-from forktex_flow.runtime.context import FlowRuntime
 from forktex_flow.runtime.driver import Driver
 from forktex_flow.runtime.execution import execute_run
-
-
-class State(TypedDict, total=False):
-    logs: Annotated[list[str], operator.add]
-
-
-def _runtime(flow: Flow) -> FlowRuntime:
-    return FlowRuntime(flow._store, flow._registry, flow._config, flow.extensions)
 
 
 @pytest.fixture
@@ -75,7 +66,7 @@ async def test_only_one_of_two_workers_holds_leadership_at_a_time(flow: Flow, se
     schema derive the same key, so exactly one can hold it — that is the whole
     failover primitive, and it is worth asserting across two real pools rather
     than two objects sharing one connection."""
-    first, second = Driver(_runtime(flow)), Driver(_runtime(second_flow))
+    first, second = Driver(runtime_for(flow)), Driver(runtime_for(second_flow))
     try:
         await flow.init()
         first.shutdown.set()
@@ -120,23 +111,23 @@ async def test_two_workers_executing_one_run_run_the_step_body_once(flow: Flow, 
     """
     executions: list[str] = []
 
-    async def side_effecting(ctx: Ctx, state: State) -> dict:
+    async def side_effecting(ctx: Ctx, state: LoggingState) -> dict:
         executions.append("ran")
         await asyncio.sleep(0.05)  # widen the window the race has to fit through
         return {"logs": ["done"]}
 
     for engine in (flow, second_flow):
-        engine.pipeline("t.once", version=1, state=State)(type("W", (), {"steps": [side_effecting]}))
+        engine.pipeline("t.once", version=1, state=LoggingState)(type("W", (), {"steps": [side_effecting]}))
 
     try:
         instance = await flow.run("t.once", state={"logs": []})
         await asyncio.gather(
-            execute_run(_runtime(flow), instance.instance_id, "t.once", 1),
-            execute_run(_runtime(second_flow), instance.instance_id, "t.once", 1),
+            execute_run(runtime_for(flow), instance.instance_id, "t.once", 1),
+            execute_run(runtime_for(second_flow), instance.instance_id, "t.once", 1),
             return_exceptions=True,
         )
 
-        async with flow.session() as session:
+        async with flow.transaction() as session:
             rows = (
                 await session.execute(
                     select(func.count()).select_from(StepRun).where(StepRun.run_id == instance.instance_id)
@@ -156,13 +147,13 @@ async def test_a_concurrent_claim_on_one_step_raises_for_the_loser(flow: Flow, s
     blind write. The loser must learn it lost — silently proceeding is how a
     reclaimed step ends up executing alongside its original attempt."""
 
-    async def noop(ctx: Ctx, state: State) -> dict:
+    async def noop(ctx: Ctx, state: LoggingState) -> dict:
         return {}
 
-    flow.pipeline("t.claim", version=1, state=State)(type("W", (), {"steps": [noop]}))
+    flow.pipeline("t.claim", version=1, state=LoggingState)(type("W", (), {"steps": [noop]}))
     try:
         instance = await flow.run("t.claim", state={})
-        step_id, status, _ = await _steps.upsert_pending_step(
+        slot = await _steps.upsert_pending_step(
             flow._store,
             run_id=instance.instance_id,
             step_name="noop",
@@ -171,7 +162,8 @@ async def test_a_concurrent_claim_on_one_step_raises_for_the_loser(flow: Flow, s
             args_hash="hash",
             max_attempts=3,
         )
-        assert status == "pending"
+        step_id = slot.step_id
+        assert slot.status == "pending"
 
         await _steps.mark_step_running(flow._store, step_id)
         with pytest.raises(StepClaimLost):
@@ -186,10 +178,10 @@ async def test_concurrent_upserts_of_one_step_converge_on_a_single_row(flow: Flo
     `IntegrityError` recovery that turns losing the race into a cache read
     rather than an error the run has to survive."""
 
-    async def noop(ctx: Ctx, state: State) -> dict:
+    async def noop(ctx: Ctx, state: LoggingState) -> dict:
         return {}
 
-    flow.pipeline("t.upsert", version=1, state=State)(type("W", (), {"steps": [noop]}))
+    flow.pipeline("t.upsert", version=1, state=LoggingState)(type("W", (), {"steps": [noop]}))
     try:
         instance = await flow.run("t.upsert", state={})
 
@@ -206,8 +198,8 @@ async def test_concurrent_upserts_of_one_step_converge_on_a_single_row(flow: Flo
 
         results = await asyncio.gather(claim(flow._store), claim(second_flow._store))
 
-        assert results[0][0] == results[1][0], "both workers must resolve to the same step row"
-        async with flow.session() as session:
+        assert results[0].step_id == results[1].step_id, "both workers must resolve to the same step row"
+        async with flow.transaction() as session:
             count = (
                 await session.execute(
                     select(func.count()).select_from(StepRun).where(StepRun.run_id == instance.instance_id)
@@ -224,11 +216,11 @@ async def test_two_drivers_claiming_pending_runs_do_not_both_take_the_same_one(f
     `FOR UPDATE SKIP LOCKED` subquery, so two leaders overlapping at handover
     partition the work instead of duplicating it."""
 
-    async def noop(ctx: Ctx, state: State) -> dict:
+    async def noop(ctx: Ctx, state: LoggingState) -> dict:
         return {}
 
     for engine in (flow, second_flow):
-        engine.pipeline("t.claims", version=1, state=State)(type("W", (), {"steps": [noop]}))
+        engine.pipeline("t.claims", version=1, state=LoggingState)(type("W", (), {"steps": [noop]}))
 
     try:
         from forktex_flow.persist import runs as _runs
@@ -276,13 +268,13 @@ async def test_runs_are_isolated_between_schemas_in_one_process(flow: Flow, post
     other_schema = "forktex_flow_" + uuid.uuid7().hex
     other = Flow(postgres_url_str, schema=other_schema)
 
-    async def noop(ctx: Ctx, state: State) -> dict:
+    async def noop(ctx: Ctx, state: LoggingState) -> dict:
         return {}
 
     try:
         await other.init()
         for engine in (flow, other):
-            engine.pipeline("t.tenant", version=1, state=State)(type("W", (), {"steps": [noop]}))
+            engine.pipeline("t.tenant", version=1, state=LoggingState)(type("W", (), {"steps": [noop]}))
 
         await flow.run("t.tenant", state={}, metadata={"tenant": "a"})
         await other.run("t.tenant", state={}, metadata={"tenant": "b"})
@@ -296,3 +288,60 @@ async def test_runs_are_isolated_between_schemas_in_one_process(flow: Flow, post
         async with other.engine.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{other_schema}" CASCADE'))
         await other.close()
+
+
+@pytest.mark.asyncio
+async def test_a_caller_cannot_commit_inside_the_engines_session(flow: Flow) -> None:
+    """The boundary ban is the guarantee: a block that writes and never commits
+    cannot be written, which is how `claim_pending_runs` silently let two
+    drivers claim the same run."""
+    from forktex.database.errors import TransactionBoundaryError
+
+    with pytest.raises(TransactionBoundaryError):
+        async with flow.transaction() as session:
+            await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "write",
+    [
+        pytest.param(lambda s, sid: _steps.mark_step_completed(s, sid, {"from": "stale"}), id="completed"),
+        pytest.param(lambda s, sid: _steps.mark_step_failed(s, sid, "stale", final=True), id="failed"),
+        pytest.param(lambda s, sid: _steps.mark_step_skipped(s, sid), id="skipped"),
+    ],
+)
+async def test_an_executor_that_lost_its_claim_cannot_write_the_step(flow: Flow, write) -> None:
+    """Only the claim was compare-and-swapped. The terminal writes were a bare
+    `WHERE id = :id`, so a reclaimed executor overwrote the row the new owner
+    was working on."""
+
+    async def only(ctx: Ctx, state: LoggingState) -> dict:
+        return {}
+
+    flow.pipeline("claim.guard", version=1, state=LoggingState)(type("W", (), {"steps": [only]}))
+    instance = await flow.run("claim.guard", version=1)
+    run_id = instance.instance_id
+    slot = await _steps.upsert_pending_step(
+        flow._store,
+        run_id=run_id,
+        step_name="only",
+        step_qualname="only",
+        step_index=0,
+        args_hash="h",
+        max_attempts=3,
+    )
+    step_id = slot.step_id
+    await _steps.mark_step_running(flow._store, step_id)
+
+    # the driver reclaims it: back to pending, a new owner will claim it
+    async with flow.transaction() as session:
+        await session.execute(update(StepRun).where(StepRun.id == step_id).values(status="pending", heartbeat_at=None))
+
+    with pytest.raises(StepClaimLost):
+        await write(flow._store, step_id)
+
+    async with flow.transaction() as session:
+        row = (await session.execute(select(StepRun).where(StepRun.id == step_id))).scalar_one()
+    assert row.status == "pending", "the stale executor overwrote the row it no longer owns"
+    assert row.output is None

@@ -21,26 +21,19 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""The driver: leader election, dispatch, and the cron claim."""
+"""The driver's leader election and dispatch. Cron is `test_schedules.py`."""
 
 from __future__ import annotations
 
 import asyncio
-import operator
-from datetime import UTC, datetime, timedelta
-from typing import Annotated, TypedDict
+import contextlib
 
 import pytest
-from sqlalchemy import select, update
 
-from forktex_flow import Ctx, Flow
-from forktex_flow.persist.models import Run, ScheduledRun
+from forktex_flow import Ctx, Flow, RuntimeConfig
+from tests.conftest import LoggingState, until
 from forktex_flow.runtime.context import FlowRuntime
 from forktex_flow.runtime.driver import Driver
-
-
-class State(TypedDict, total=False):
-    logs: Annotated[list[str], operator.add]
 
 
 def _driver(flow: Flow) -> Driver:
@@ -55,192 +48,14 @@ def _driver(flow: Flow) -> Driver:
 
 
 @pytest.mark.asyncio
-async def test_a_due_schedule_fires_exactly_once_under_two_competing_drivers(flow: Flow):
-    """The bug this rewrite fixes.
-
-    The previous claim SELECTed due rows, mutated the ORM objects and committed,
-    while its docstring claimed `UPDATE … RETURNING` atomicity. Two drivers
-    overlapping for one tick — which is exactly what leader handover is — both
-    read the same due row and both fired it. The claim is now a compare-and-swap
-    on `next_fire_at`, so precisely one of them matches a row.
-
-    The row has to be backdated by hand: a freshly registered schedule's
-    `next_fire_at` is always in the future, so a test that merely registers one
-    and races two drivers asserts nothing at all.
-    """
-
-    async def scheduled_body(ctx: Ctx, state: State) -> dict:
-        return {"logs": ["fired"]}
-
-    flow.scheduled("t.cron", version=1, cron="* * * * *", state=State)(scheduled_body)
-
-    first, second = _driver(flow), _driver(flow)
-    await first._fire_due_schedules()  # creates the row, fires nothing yet
-
-    async with flow.session() as session:
-        assert (await session.execute(select(Run).where(Run.workflow_name == "t.cron"))).first() is None
-        await session.execute(
-            update(ScheduledRun)
-            .where(ScheduledRun.workflow_name == "t.cron")
-            .values(next_fire_at=datetime.now(UTC) - timedelta(minutes=5))
-        )
-        await session.commit()
-
-    # Two leaders, same due row, at the same moment.
-    await asyncio.gather(first._fire_due_schedules(), second._fire_due_schedules())
-
-    async with flow.session() as session:
-        runs = (await session.execute(select(Run).where(Run.workflow_name == "t.cron"))).scalars().all()
-
-    assert len(runs) == 1, f"a due schedule fired {len(runs)} times; exactly one worker may win the claim"
-    assert runs[0].triggered_by == "schedule"
-
-
-@pytest.mark.asyncio
-async def test_a_fired_schedule_advances_past_now_rather_than_backlogging(flow: Flow):
-    """A leader that fell behind must not then work through every occurrence it
-    slept past — the next fire is computed from now, not from the missed
-    deadline."""
-
-    async def body(ctx: Ctx, state: State) -> dict:
-        return {}
-
-    flow.scheduled("t.behind", version=1, cron="* * * * *", state=State)(body)
-    driver = _driver(flow)
-    await driver._fire_due_schedules()
-
-    async with flow.session() as session:
-        await session.execute(
-            update(ScheduledRun)
-            .where(ScheduledRun.workflow_name == "t.behind")
-            .values(next_fire_at=datetime.now(UTC) - timedelta(hours=3))
-        )
-        await session.commit()
-
-    await driver._fire_due_schedules()
-
-    async with flow.session() as session:
-        row = (await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.behind"))).scalar_one()
-        runs = (await session.execute(select(Run).where(Run.workflow_name == "t.behind"))).scalars().all()
-
-    assert len(runs) == 1, "three hours of missed minutes must not become 180 runs"
-    assert row.next_fire_at > datetime.now(UTC) - timedelta(minutes=1)
-
-
-@pytest.mark.asyncio
-async def test_a_schedule_row_is_created_for_a_registered_cron_workflow(flow: Flow):
-    async def body(ctx: Ctx, state: State) -> dict:
-        return {}
-
-    flow.scheduled("t.registered", version=2, cron="0 3 * * *", state=State)(body)
-    await _driver(flow)._fire_due_schedules()
-
-    async with flow.session() as session:
-        row = (
-            await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.registered"))
-        ).scalar_one()
-
-    assert row.cron == "0 3 * * *"
-    assert row.enabled is True
-    assert row.next_fire_at is not None
-
-
-@pytest.mark.asyncio
-async def test_editing_a_cron_in_code_updates_the_stored_schedule(flow: Flow):
-    """A schedule row outlives the process that created it, so a cron changed in
-    code has to reach the row — otherwise the old expression runs forever and
-    the source of truth is a database nobody looks at."""
-
-    async def body(ctx: Ctx, state: State) -> dict:
-        return {}
-
-    flow.scheduled("t.changing", version=1, cron="0 1 * * *", state=State)(body)
-    await _driver(flow)._fire_due_schedules()
-
-    revised = Flow(database=flow._db, schema=flow.schema)
-    revised.scheduled("t.changing", version=1, cron="30 4 * * *", state=State)(body)
-    await _driver(revised)._fire_due_schedules()
-
-    async with flow.session() as session:
-        row = (
-            await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.changing"))
-        ).scalar_one()
-
-    assert row.cron == "30 4 * * *"
-
-
-@pytest.mark.asyncio
-async def test_a_schedule_registered_disabled_gets_a_row_and_does_not_fire(flow: Flow):
-    """`enabled=False` registers the timer without starting it.
-
-    The case this exists for is a cron whose first tick is destructive — a
-    reaper that dispatches a destroy against expired infrastructure. Arming it
-    the instant the process boots, and disarming afterwards, loses that race:
-    the first tick can land before anyone runs the UPDATE.
-    """
-
-    async def body(ctx: Ctx, state: State) -> dict:
-        return {"logs": ["fired"]}
-
-    # A cron that is due every minute, so "did not fire" is a real assertion
-    # rather than an artefact of nothing being due yet.
-    flow.scheduled("t.disarmed", version=1, cron="* * * * *", state=State, enabled=False)(body)
-    driver = _driver(flow)
-    await driver._fire_due_schedules()
-    await driver._fire_due_schedules()
-
-    async with flow.session() as session:
-        row = (
-            await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.disarmed"))
-        ).scalar_one()
-        runs = (await session.execute(select(Run).where(Run.workflow_name == "t.disarmed"))).scalars().all()
-
-    assert row.enabled is False, "the row exists but must not be armed"
-    assert runs == [], "a disabled schedule dispatched a run"
-
-
-@pytest.mark.asyncio
-async def test_arming_a_schedule_survives_re_registration(flow: Flow):
-    """Once armed, the database owns the switch.
-
-    `enabled` is read on the first insert only. If re-registration wrote it
-    back, every deploy would silently re-disarm a schedule an operator had
-    turned on — or worse, re-arm one they had turned off, which is how a reaper
-    comes back from the dead. The upsert updates `cron` and nothing else.
-    """
-
-    async def body(ctx: Ctx, state: State) -> dict:
-        return {}
-
-    flow.scheduled("t.armed", version=1, cron="0 1 * * *", state=State, enabled=False)(body)
-    await _driver(flow)._fire_due_schedules()
-
-    async with flow.session() as session:
-        await session.execute(update(ScheduledRun).where(ScheduledRun.workflow_name == "t.armed").values(enabled=True))
-        await session.commit()
-
-    # A fresh process registering the same workflow — still declaring it
-    # disabled, as the code always will.
-    revised = Flow(database=flow._db, schema=flow.schema)
-    revised.scheduled("t.armed", version=1, cron="0 2 * * *", state=State, enabled=False)(body)
-    await _driver(revised)._fire_due_schedules()
-
-    async with flow.session() as session:
-        row = (await session.execute(select(ScheduledRun).where(ScheduledRun.workflow_name == "t.armed"))).scalar_one()
-
-    assert row.enabled is True, "re-registration disarmed a schedule an operator had armed"
-    assert row.cron == "0 2 * * *", "the cron should still track the code"
-
-
-@pytest.mark.asyncio
 async def test_the_driver_claims_and_completes_a_pending_run(flow: Flow):
     """The whole loop, once: a submitted run is claimed, dispatched, executed
     and marked completed without anyone calling the executor directly."""
 
-    async def work(ctx: Ctx, state: State) -> dict:
+    async def work(ctx: Ctx, state: LoggingState) -> dict:
         return {"logs": ["done"]}
 
-    @flow.pipeline("t.driven", version=1, state=State)
+    @flow.pipeline("t.driven", version=1, state=LoggingState)
     class Driven:
         steps = [work]
 
@@ -257,15 +72,31 @@ async def test_the_driver_claims_and_completes_a_pending_run(flow: Flow):
 
 @pytest.mark.asyncio
 async def test_only_one_of_two_drivers_becomes_leader(flow: Flow):
-    """Leadership is a Postgres advisory lock, so this is really asserting that
-    two Flows on one schema derive the same lock key."""
-    first, second = _driver(flow), _driver(flow)
-    first.shutdown.set()
-    second.shutdown.set()
+    """Mutual exclusion while both are live.
 
-    results = await asyncio.gather(first._compete_for_leadership(), second._compete_for_leadership())
-    assert results == [None, None]
-    assert not (first.is_leader and second.is_leader)
+    Setting `shutdown` before competing makes this vacuous: each loop exits at
+    once and the `finally` clears `is_leader`, so both end up False and
+    `not (first and second)` holds however the lock behaved. Both have to be
+    inside the lock at the same instant for the assertion to mean anything.
+    """
+    first, second = _driver(flow), _driver(flow)
+    assert first.runtime.config.leader_lock_key == second.runtime.config.leader_lock_key
+
+    racing = [
+        asyncio.create_task(first._compete_for_leadership()),
+        asyncio.create_task(second._compete_for_leadership()),
+    ]
+    try:
+        await until(lambda: first.is_leader or second.is_leader)
+        assert first.is_leader != second.is_leader, "two drivers held the same lock at once"
+        assert await (first if first.is_leader else second)._still_leader()
+        assert not await (second if first.is_leader else first)._still_leader()
+    finally:
+        first.shutdown.set()
+        second.shutdown.set()
+        for task in racing:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(task, timeout=5)
 
 
 @pytest.mark.asyncio
@@ -289,10 +120,10 @@ async def test_the_live_driver_loop_picks_up_and_completes_a_run(flow: Flow, pos
     try:
         await live.init()
 
-        async def work(ctx: Ctx, state: State) -> dict:
+        async def work(ctx: Ctx, state: LoggingState) -> dict:
             return {"logs": ["driven"]}
 
-        live.pipeline("t.live", version=1, state=State)(type("W", (), {"steps": [work]}))
+        live.pipeline("t.live", version=1, state=LoggingState)(type("W", (), {"steps": [work]}))
         instance = await live.run("t.live", state={"logs": []})
 
         await live.start_driver()
@@ -329,20 +160,21 @@ async def test_a_second_worker_takes_over_when_the_leader_stops(flow: Flow, post
     leader = Flow(postgres_url_str, schema=schema, config=config)
     standby = Flow(postgres_url_str, schema=schema, config=config)
 
-    async def work(ctx: Ctx, state: State) -> dict:
+    async def work(ctx: Ctx, state: LoggingState) -> dict:
         return {"logs": ["done"]}
 
     try:
         await leader.init()
         for engine in (leader, standby):
-            engine.pipeline("t.failover", version=1, state=State)(type("W", (), {"steps": [work]}))
+            engine.pipeline("t.failover", version=1, state=LoggingState)(type("W", (), {"steps": [work]}))
 
         await leader.start_driver()
         await standby.start_driver()
-        await asyncio.sleep(0.3)  # let the election settle
 
-        # Exactly one of them drives.
-        assert not (leader._driver.is_leader and standby._driver.is_leader)
+        # Exactly one of them drives. Asserting only that they are not *both*
+        # leader passes trivially while neither has won yet, so wait for one.
+        await until(lambda: leader._driver.is_leader or standby._driver.is_leader)
+        assert leader._driver.is_leader != standby._driver.is_leader
 
         # The leader goes away with work outstanding.
         instance = await standby.run("t.failover", state={"logs": []})
@@ -357,3 +189,101 @@ async def test_a_second_worker_takes_over_when_the_leader_stops(flow: Flow, post
         async with standby.engine.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await standby.close()
+
+
+@pytest.mark.asyncio
+async def test_verify_probes_the_pool_without_touching_the_schema(postgres_url_str: str) -> None:
+    """A readiness probe must not migrate: `init()` owns the schema, `verify()`
+    only answers whether the pool can reach Postgres."""
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from forktex.database import DatabaseUnreachableError
+
+    schema = "forktex_flow_" + _uuid.uuid7().hex
+    unmigrated = Flow(postgres_url_str, schema=schema)
+    try:
+        await unmigrated.verify()
+        async with unmigrated.engine.connect() as conn:
+            found = await conn.execute(
+                text("SELECT 1 FROM information_schema.schemata WHERE schema_name = :s"), {"s": schema}
+            )
+            assert found.first() is None, "verify() created the schema it was only meant to probe"
+    finally:
+        await unmigrated.close()
+
+    unreachable = Flow("postgresql+asyncpg://nobody:nobody@127.0.0.1:1/nothing", schema="probe")
+    try:
+        with pytest.raises(DatabaseUnreachableError, match="not reachable"):
+            await unreachable.verify()
+    finally:
+        await unreachable.close()
+
+
+@pytest.mark.asyncio
+async def test_the_driver_does_not_claim_past_its_concurrency_cap(flow: Flow) -> None:
+    """The batch bounded one claim, not the total. Ten runs were claimed every
+    tick regardless of how many were still executing, so a backlog of slow runs
+    accumulated in flight at the batch size per second.
+    """
+    gate = asyncio.Event()
+
+    async def blocks(ctx: Ctx, state: LoggingState) -> dict:
+        await gate.wait()
+        return {"logs": ["done"]}
+
+    flow.pipeline("t.cap", version=1, state=LoggingState)(type("W", (), {"steps": [blocks]}))
+    driver = Driver(
+        FlowRuntime(
+            store=flow._store,
+            registry=flow._registry,
+            config=RuntimeConfig(max_concurrent_runs=2),
+            extensions=flow.extensions,
+        )
+    )
+
+    for _ in range(5):
+        await flow.run("t.cap", state={"logs": []})
+
+    try:
+        await driver._claim_and_dispatch()
+        await driver._claim_and_dispatch()
+        assert len(driver._in_flight) == 2, f"claimed {len(driver._in_flight)} with a cap of 2"
+    finally:
+        gate.set()
+        driver.shutdown.set()
+        await driver._drain_tasks(timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_two_flows_on_different_schemas_elect_independently(postgres_url_str: str) -> None:
+    """Leader election is one advisory lock, and the key was folded from the
+    literal `forktex_flow` rather than the instance's schema — so two unrelated
+    tenants shared a leader and one of them never drove, its schedules never
+    firing. A custom `RuntimeConfig` was worse: the default key only applied
+    when no config was passed, leaving the key at 0 for everyone else.
+    """
+    import uuid as _uuid
+
+    a = Flow(postgres_url_str, schema="tenant_a_" + _uuid.uuid7().hex[:12])
+    b = Flow(postgres_url_str, schema="tenant_b_" + _uuid.uuid7().hex[:12])
+    tuned = Flow(
+        postgres_url_str,
+        schema="tenant_c_" + _uuid.uuid7().hex[:12],
+        config=RuntimeConfig(poll_interval=0.5),
+    )
+    keys = {a._config.leader_lock_key, b._config.leader_lock_key, tuned._config.leader_lock_key}
+    assert len(keys) == 3, f"schemas share a lock key: {keys}"
+    assert 0 not in keys, "a lock key was left at the derive sentinel"
+
+    try:
+        await a.init()
+        await b.init()
+        await a.start_driver()
+        await b.start_driver()
+        await until(lambda: a._driver.is_leader and b._driver.is_leader)
+    finally:
+        await a.close()
+        await b.close()
+        await tuned.close()

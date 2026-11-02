@@ -5,6 +5,149 @@ All notable changes to `forktex-flow` are documented here. This project follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-02
+
+Requires `forktex>=0.15,<0.16`.
+
+### Breaking
+
+**`Flow.session()` is now `Flow.transaction()`**, and `FlowStore.session()` is
+`FlowStore.transaction()`. The method always owned the boundary and raised
+`TransactionBoundaryError` on `commit()`; forktex 0.15 gives `session()` the opposite meaning —
+a session whose boundary the caller owns — so keeping the old name would have inverted it.
+
+Replace `async with flow.session() as session:` with `async with flow.transaction() as session:`.
+
+
+## [0.4.0] — 2026-11-01
+
+### Fixed
+
+- **A run whose worker died between steps stayed `running` forever.** Recovery could only see
+  a run through its step rows, and a run has none before its first step, between any two steps,
+  or after its last — so a worker lost in any of those windows left a run nothing would pick up.
+  Runs now carry `heartbeat_at`, stamped for the whole of `execute_run`, and the revive sweep
+  re-pends a `running` run with no live step whose heartbeat has gone stale.
+- **Two `Flow`s on different schemas shared a leader, and one of them never drove.** The
+  advisory-lock key was folded from the literal `forktex_flow` rather than the instance's schema,
+  and the derived default applied only when no `RuntimeConfig` was passed — so any consumer
+  supplying a config got key `0`, which nothing special-cased. Unrelated tenants competed for one
+  lock: whichever won drove, the other idled with its schedules never firing.
+  `RuntimeConfig.leader_lock_key` left at 0 now derives from the instance's own schema.
+- **A leader that lost its advisory lock kept driving.** The lock was taken once and never
+  rechecked, so a terminated backend, a Postgres restart or a pooler recycle left two workers
+  both believing they led. The driver now revalidates each tick and stands down.
+- **Two concurrent `start_driver()` calls leaked a driver that could not be stopped.** The
+  second overwrote the first's handle while it was still holding the leader lock; the call is
+  now serialised.
+- **A step's completion, failure or skip could be recorded by a worker that no longer owned
+  it.** Those writes now require the row to still be `running` and raise `StepClaimLost`
+  if it is not; `heartbeat_step` reports the loss instead of stamping a row it does not own.
+- **A cancelled run emitted `run_completed`** and fired `after_complete`.
+- **`after_complete` and `after_fail` were handed the snapshot taken before execution**, whose
+  status is still `running`, so an extension branching on it saw a run that never finished.
+- **A cron occurrence could be consumed without its run being created.** The schedule advance
+  committed in its own transaction and the insert followed in another, with its failure logged
+  and swallowed — so one blip skipped the job while `last_fired_at` claimed it had run. Both
+  now share a transaction.
+- **A reducer was silently dropped** when the state `TypedDict` used
+  `from __future__ import annotations` together with a name imported only under `TYPE_CHECKING`:
+  one unresolvable annotation discarded *every* reducer on the class, and conflicting updates
+  then overwrote each other instead of merging. Annotations are now resolved per field.
+- **`update_run_output` could overwrite a terminal run's output.**
+- **The memoisation key could depend on a heap address.** A state value JSONB could not take
+  fell back to `str(value)`, which for an object without its own `__str__` renders as
+  `<Class object at 0x...>` — so the same state hashed differently in the next process and a
+  completed step re-executed. Such a value now raises `StateNotSerialisable`, which is the run
+  failure the state write would cause anyway.
+- **A step whose output was exactly `{"__skipped__": true}` lost it on replay.** The skip was
+  carried in the output payload, which is a value a step body may return; it is now a column.
+
+### Added
+
+- `Flow.verify()` — probes the pool without migrating, for a readiness check.
+- `make lock-check` — `poetry check --lock`, first in `ci`.
+- The baseline is one migration per table — `v0001__workflow`, `v0002__run`, `v0003__step_run`,
+  `v0004__run_event`, `v0005__scheduled_run` — each complete and final. They apply in FK
+  dependency order, which the runner's numeric ordering is what guarantees.
+- `RunClaim` and `StepSlot` replace the ad-hoc tuples returned by `claim_pending_runs` and
+  `upsert_pending_step`; `StepSlot.status` is typed, so a status comparison is checked.
+- `RuntimeConfig.max_concurrent_runs` (default 10) bounds the runs one worker executes at once.
+  The claim batch bounded a single claim, not the total, so runs slower than the poll interval
+  accumulated in flight at the batch size every tick.
+- `FlowClosed` and `StateNotSerialisable` join the root surface, which is now 28 names. Both are
+  reachable from consumer code: one from calling an entry point after `close()`, the other from
+  returning a value JSONB cannot take.
+
+### Changed
+
+- **Docstrings carry contracts, not rationale.** `src/` went from 26% docstring lines to 8%: a
+  docstring survives only where it states something the name and signature cannot — what a call
+  raises, an ownership guard, that `Ctx.sleep` is not durable. Design rationale and worked examples
+  were removed; `docs/flow.md`, `docs/operating.md` and this file already carried them. Gates
+  forbid a docstring that restates its own name, and one on an `@overload` stub.
+- **`docs/operating.md` carries the operator actions no route covers** — arming or disarming a
+  schedule, pruning history through the cascade, and resetting the schema. Its SQL is executed
+  against a migrated schema by `tests/test_persist/test_operator_sql.py`, so a stale column name
+  is found here rather than by whoever is mid-incident.
+- **`README.md` is a complete map of consumer options** — thirteen sections from declaring a
+  workflow to reading the engine's own tables, with every `RuntimeConfig` field, `InstanceQuery`
+  filter and terminal, `WorkflowInstance` call and `Ctx` call in a table. Gates assert that every
+  public call and config default appears there, so a new option cannot ship undocumented.
+- Every JSONB-carried mapping is typed `forktex.types.JsonObject` rather than `dict[str, Any]`.
+  A SQLAlchemy column→value mapping stays `dict[str, Any]`: it carries `sa.func.now()`, not JSON.
+- A module declares its public surface before its helpers, asserted by `test_conventions.py`.
+- `make test` reports exact coverage (`--cov-precision=2`) instead of a rounded figure the floor
+  did not compare against.
+- Gates assert the import surface: `import forktex_flow` pulls in no web framework or S3 client,
+  and `src/` reaches for no `forktex` module beyond `database`, `error`, `iso`, `log` and `types`.
+- `docs/operating.md` is new: durability, leadership, what to watch and the schema move there from
+  `docs/flow.md`, which is now the API reference alone.
+- The schema-drift gate compares the models to a migrated database with alembic's own
+  comparator, so a divergence in a type, nullability, server default, constraint or index fails
+  it — not only a missing column. The models now declare every index the SQL creates, by name
+  and shape; four they had declared did not exist, two of them not in any shape.
+- The status vocabulary is derived from `RunStatus` rather than restated in `persist/models.py`.
+- `close()` marks the handle closed, and `init`, `verify`, `start_driver`, `run` and `get` raise
+  `FlowClosed` afterwards. Disposing the pool left the handle working, so a later call quietly
+  built a fresh pool that nothing would dispose.
+- Schedule rows are seeded once per leadership term rather than twice per schedule per tick.
+- `step_run` constrains `skipped` to completed rows. The column admitted a `running` step marked
+  skipped — a state the executor cannot interpret — with the invariant held by its one caller
+  rather than by the table.
+- The terminal extension hooks are dispatched through a `TerminalHook` literal, so a misspelled
+  hook name is a type error rather than a dispatch that silently notifies nobody.
+
+### Breaking
+
+- **The migration baseline was rebuilt and `v0001__schema.sql` withdrawn.** 0.2.0 and 0.2.1
+  shipped it, so a database created by either records version 1 and skips the new
+  `v0001__workflow.sql` as already applied. `Flow.init()` then stops at `v0002__run.sql` with
+
+  ```
+  MigrationError: migration 'v0002__run.sql' failed and was rolled back
+  ```
+
+  — `CREATE TABLE IF NOT EXISTS run` is a no-op on the existing table, and
+  `ix_run_status_heartbeat` then indexes a `heartbeat_at` column that database has never had. It fails
+  loudly and rolls back rather than half-upgrading. There is no in-place upgrade from 0.2.x: drop
+  the schema and let `Flow.init()` rebuild it.
+
+  ```sql
+  DROP SCHEMA forktex_flow CASCADE;
+  ```
+
+  This discards run history and `scheduled_run`, whose `enabled` flags the database owns — every
+  schedule comes back **disarmed**. Done while 0.4.0 is unpublished and pre-1.0; the baseline is
+  fixed from this release on.
+- Requires `forktex>=0.14,<0.15`, whose migration runner verifies an applied migration's content
+  and refuses an out-of-order version. `Database.session()` was removed in forktex 0.13.
+- **`Flow.session()` and `FlowStore.session()` no longer let the caller commit.** They are
+  `forktex.database.transactional_session()`: one transaction per block, committed on clean exit,
+  rolled back on error, and `commit()`/`rollback()`/`begin()` raise `TransactionBoundaryError`.
+  Delete the commit from any block you open through them; to write to your own tables, use your
+  own session.
+
 ## [0.2.1] — 2026-10-13
 
 ### Fixed

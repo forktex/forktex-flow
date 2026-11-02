@@ -36,15 +36,18 @@ import re
 
 import pytest
 
+from pydantic import BaseModel
+
 import forktex_flow
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
 REFERENCE = ROOT / "docs" / "flow.md"
 DEVELOPMENT = ROOT / "docs" / "development.md"
+OPERATING = ROOT / "docs" / "operating.md"
 
 
-@pytest.mark.parametrize("page", [README, REFERENCE, DEVELOPMENT], ids=lambda p: p.name)
+@pytest.mark.parametrize("page", [README, REFERENCE, DEVELOPMENT, OPERATING], ids=lambda p: p.name)
 def test_the_page_exists_and_is_not_a_stub(page: pathlib.Path):
     assert page.exists(), f"{page.name} is missing"
     assert len(page.read_text(encoding="utf-8").splitlines()) > 40, f"{page.name} looks like a stub"
@@ -140,3 +143,70 @@ def test_the_declared_python_floor_is_stated_where_a_reader_installs():
     text = README.read_text(encoding="utf-8")
     install = text[text.index("## Installing") :]
     assert "3.14" in install.split("## Wiring")[0], "the install section does not name the Python floor"
+
+
+def test_the_readme_documents_every_runtime_config_field_and_its_default():
+    """The README is the map of what a consumer can set. A new knob that only
+    the code knows about is a knob nobody finds, and a default that drifts from
+    the table silently misinforms every reader of it.
+    """
+    readme = README.read_text(encoding="utf-8")
+    documented = dict(re.findall(r"^\| `(\w+)` \| `([^`]+)` \|", readme, re.M))
+    fields = forktex_flow.RuntimeConfig.model_fields
+
+    missing = sorted(set(fields) - set(documented))
+    assert missing == [], f"RuntimeConfig fields absent from the README: {missing}"
+
+    wrong = [
+        f"{name}: README says {documented[name]}, code says {fields[name].default!r}"
+        for name in fields
+        if documented[name].replace("'", "") != repr(fields[name].default).replace("'", "")
+    ]
+    assert wrong == [], "documented defaults disagree with the code:\n  " + "\n  ".join(wrong)
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [forktex_flow.Flow, forktex_flow.InstanceQuery, forktex_flow.WorkflowInstance, forktex_flow.Ctx],
+    ids=lambda h: h.__name__,
+)
+def test_the_readme_names_every_call_a_consumer_can_make(holder: type):
+    """Everything public on the four objects a consumer holds. The README
+    claims to depict every option, so an undocumented call makes that false.
+    """
+    readme = README.read_text(encoding="utf-8")
+    inherited = set(dir(BaseModel)) if issubclass(holder, BaseModel) else set()
+    fields = set(getattr(holder, "model_fields", {}))
+    public = {name for name in dir(holder) if not name.startswith("_") and name not in inherited and name not in fields}
+    # A call may appear as `flow.engine`, `.metadata(**kv)`, `await q.count()`
+    # or inside a fenced example. Fences are pulled out first: their triple
+    # backticks otherwise pair with the inline ones and swallow whole sections.
+    fenced = re.findall(r"```.*?```", readme, re.S)
+    inline = re.findall(r"`([^`\n]+)`", re.sub(r"```.*?```", "", readme, flags=re.S))
+    mentioned = set(re.findall(r"\w+", " ".join(fenced + inline)))
+    missing = sorted(name for name in public if name not in mentioned)
+    assert missing == [], f"{holder.__name__} calls absent from the README: {missing}"
+
+
+@pytest.mark.parametrize("page", [README, REFERENCE, DEVELOPMENT, OPERATING], ids=lambda p: p.name)
+def test_every_make_target_a_page_names_exists(page: pathlib.Path):
+    """A documented command that does not exist sends a reader to an error."""
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    real = set(re.findall(r"^([a-z][a-z0-9-]*):", makefile, re.M))
+    text = page.read_text(encoding="utf-8")
+    # Only inside a code span or fence: "make an informed choice" is prose.
+    code = " ".join(re.findall(r"```.*?```", text, re.S) + re.findall(r"`([^`\n]+)`", text))
+    named = sorted(set(re.findall(r"\bmake ([a-z][a-z0-9-]*)", code)))
+    missing = [target for target in named if target not in real]
+    assert missing == [], f"{page.name} names make targets that do not exist: {missing}"
+
+
+@pytest.mark.parametrize("page", [README, REFERENCE, DEVELOPMENT, OPERATING], ids=lambda p: p.name)
+def test_every_repository_path_a_page_points_at_exists(page: pathlib.Path):
+    """A path in a doc is an instruction to go and look. `{...}` is a template,
+    not a path, and is skipped.
+    """
+    # `{...}` marks a filename template rather than a path to go and look at.
+    cited = sorted(set(re.findall(r"`((?:src|tests|docs)/[\w./-]+)`", page.read_text(encoding="utf-8"))))
+    missing = [path for path in cited if not (ROOT / path).exists()]
+    assert missing == [], f"{page.name} points at paths that do not exist: {missing}"

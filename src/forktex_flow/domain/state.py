@@ -21,56 +21,32 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""State reduction: extract ``Annotated`` reducers and merge partial updates.
-
-A step returns the *delta* it wants applied, not the whole state. How a delta is
-combined with what is already there is declared on the state class itself::
-
-    class DeployState(TypedDict):
-        logs: Annotated[list[str], operator.add]   # accumulates
-        server_id: str                             # last write wins
-
-This is the single merge point for the whole engine. Every path that advances a
-run's state goes through :func:`apply_state_update`; nothing calls ``dict.update``
-on a run state, because that silently turns an accumulator into an overwrite and
-the only symptom is a log that keeps just its final line.
-"""
 
 from __future__ import annotations
 
+import annotationlib
 from collections.abc import Callable
-from typing import Annotated, Any, get_args, get_origin, get_type_hints
+from typing import Annotated, Any, get_args, get_origin
+
+from forktex.log import get_logger
+from forktex.types import JsonObject
 
 #: ``reducer(existing, incoming) -> merged``.
+logger = get_logger(__name__)
+
 ReducerFn = Callable[[Any, Any], Any]
 
 
 def extract_reducers(state_cls: type | None) -> dict[str, ReducerFn]:
-    """Build ``{field: reducer}`` from a state class's ``Annotated`` hints.
-
-    ``Annotated[list[str], operator.add]`` yields ``operator.add`` for that
-    field. Everything else is absent from the result, which the merge reads as
-    last-write-wins. Only callable metadata is treated as a reducer, so
-    ``Annotated`` may also carry documentation strings or validators without
-    breaking extraction.
-
-    ``None`` (an untyped ``dict`` state) yields no reducers.
+    """Build ``{field: reducer}`` from a state class's ``Annotated`` hints. A state class under ``from __future__
+    import annotations`` holding a name that exists only for the type checker cannot be resolved as a whole, and
+    resolving it as a whole would drop every reducer beside the unresolvable field.
     """
     if state_cls is None:
         return {}
 
     reducers: dict[str, ReducerFn] = {}
-    try:
-        hints = get_type_hints(state_cls, include_extras=True)
-    except NameError, TypeError:
-        # A state class defined with an unresolvable forward reference — in a
-        # REPL, or under `from __future__ import annotations` where a name is
-        # only imported under TYPE_CHECKING. Fall back to the raw annotations:
-        # they are strings there, so no reducer is found and every field
-        # becomes last-write-wins, which is the safe direction to fail.
-        hints = getattr(state_cls, "__annotations__", {})
-
-    for field_name, hint in hints.items():
+    for field_name, hint in _resolved_hints(state_cls).items():
         if get_origin(hint) is not Annotated:
             continue
         for meta in get_args(hint)[1:]:
@@ -82,18 +58,13 @@ def extract_reducers(state_cls: type | None) -> dict[str, ReducerFn]:
 
 
 def apply_state_update(
-    current: dict[str, Any],
-    update: dict[str, Any],
+    current: JsonObject,
+    update: JsonObject,
     reducers: dict[str, ReducerFn],
-) -> dict[str, Any]:
-    """Merge a step's partial ``update`` into ``current`` using ``reducers``.
-
-    A key with a reducer *and* an existing value is combined:
-    ``reducer(current[key], new)``. Otherwise the new value is used as-is — a
-    reducer is never called against a missing key, so ``operator.add`` on the
-    first write does not have to cope with ``None``.
-
-    Returns a new dict; ``current`` is not mutated.
+) -> JsonObject:
+    """Merge a step's partial ``update`` into ``current`` using ``reducers``. A key with no reducer, or no existing
+    value, takes the new value as-is; a reducer is never called against a missing key, so ``operator.add`` on
+    the first write does not have to cope with ``None``.
     """
     result = dict(current)
     for key, new_value in update.items():
@@ -105,3 +76,26 @@ def apply_state_update(
 
 
 __all__ = ["ReducerFn", "apply_state_update", "extract_reducers"]
+
+
+def _resolved_hints(state_cls: type) -> dict[str, object]:
+    try:
+        raw = annotationlib.get_annotations(state_cls, format=annotationlib.Format.VALUE, eval_str=True)
+    except Exception:
+        logger.warning("could not read annotations of %s; its reducers are lost", state_cls.__qualname__)
+        return {}
+
+    resolved: dict[str, object] = {}
+    for field_name, hint in raw.items():
+        if not isinstance(hint, annotationlib.ForwardRef):
+            resolved[field_name] = hint
+            continue
+        try:
+            resolved[field_name] = hint.evaluate()
+        except Exception:
+            logger.debug(
+                "%s.%s has an unresolvable annotation; it carries no reducer",
+                state_cls.__qualname__,
+                field_name,
+            )
+    return resolved
