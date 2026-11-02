@@ -21,18 +21,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Flow's persistence layer: the ORM tables and one module per aggregate.
-
-`models` declares the tables on `substrate_base("forktex_flow")` — its own
-`MetaData`, so a consumer's `BaseDBModel.metadata.create_all()` never tries to
-build this library's schema. `migrations` owns the forward-only SQL. The
-aggregate modules (`runs`, `steps`) hold the reads and writes for one table
-each; `mappers` turns a row into a domain value object; `store` is the handle
-they all take.
-
-This layer emits **no raw SQL**. Every statement is a SQLAlchemy construct,
-which is also what lets `schema_translate_map` rewrite the schema per Flow
-instance for free.
+"""Flow's persistence layer: the ORM tables and one module per aggregate. `models` declares the tables on
+`substrate_base("forktex_flow")` — its own `MetaData`, so a consumer's `BaseDBModel.metadata.create_all()` never
+tries to build this library's schema.
 """
 
 from forktex_flow.persist.migrations import apply_migrations

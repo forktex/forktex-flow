@@ -21,36 +21,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Postgres-native durable workflow execution, built on the ``forktex`` substrate.
-
-A workflow is an ordered list of steps. Declare one of two ways::
-
-    flow = Flow(database_url="postgresql+asyncpg://...")
-
-    @flow.scheduled("cloud.backup.create", version=1, cron="0 2 * * *", state=BackupState)
-    async def backup_create(ctx: Ctx, state: BackupState) -> dict: ...
-
-    @flow.pipeline("cloud.deploy.apply", version=4, state=DeployState)
-    class DeployApply:
-        steps = [load_manifest, provision, step(dns_setup, when=lambda s: s["dns_enabled"])]
-
-Dispatch and read::
-
-    instance = await flow.run("cloud.deploy.apply", state={...}, metadata={...})
-    page = await flow.query().workflow("cloud.deploy.apply").status("running").fetch()
-
-A step is ``async def fn(ctx: Ctx, state: dict) -> dict`` and returns the *delta*
-it wants merged, not the whole state. How a delta merges is declared on the
-state class::
-
-    class DeployState(TypedDict):
-        logs: Annotated[list[str], operator.add]   # accumulates across steps
-        server_id: str                             # last write wins
-
-Every step is memoised on ``(run_id, step, input state)``, so a run picked up
-after a crash re-executes from the top and skips straight past the work that
-already happened.
-"""
+"""Postgres-native durable workflow execution, built on the ``forktex`` substrate."""
 
 from forktex_flow.domain.config import RuntimeConfig
 from forktex_flow.domain.node import StepSpec, step
@@ -63,7 +34,14 @@ from forktex_flow.domain.types import (
     StepRunInfo,
     StepStatus,
 )
-from forktex_flow.errors import FlowError, StepFailed, WorkflowCancelled, WorkflowFailed
+from forktex_flow.errors import (
+    FlowClosed,
+    FlowError,
+    StateNotSerialisable,
+    StepFailed,
+    WorkflowCancelled,
+    WorkflowFailed,
+)
 from forktex_flow.extension import FlowExtension
 from forktex_flow.flow import Flow
 from forktex_flow.persist.migrations import apply_migrations
@@ -80,6 +58,7 @@ __all__ = [
     "TERMINAL_STATUSES",
     "Ctx",
     "Flow",
+    "FlowClosed",
     "FlowError",
     "FlowExtension",
     "InstancePage",
@@ -89,6 +68,7 @@ __all__ = [
     "RunStatus",
     "RunSummary",
     "RuntimeConfig",
+    "StateNotSerialisable",
     "StepFailed",
     "StepRunInfo",
     "StepSpec",

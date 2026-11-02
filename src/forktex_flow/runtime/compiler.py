@@ -21,13 +21,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Turning a decorated function or class into a :class:`WorkflowDefinition`.
-
-Two entry points, because there are two ways to declare a workflow: a single
-async function on a cron (:func:`compile_scheduled`) and a class with a ``steps``
-list (:func:`compile_pipeline`). Both produce the same ordered node list, so the
-executor has one shape to run rather than one per declaration style.
-"""
 
 from __future__ import annotations
 
@@ -43,44 +36,6 @@ from forktex_flow.domain.state import ReducerFn, extract_reducers
 __all__ = ["compile_pipeline", "compile_scheduled"]
 
 
-def _resolve_step(item: NodeFn | StepSpec, defaults: RuntimeConfig) -> tuple[NodeFn, StepMeta | None, WhenFn | None]:
-    """Extract ``(fn, meta, when_fn)`` from one entry in a ``steps`` list.
-
-    An entry is either a plain callable — ``@step``-decorated or bare — or a
-    :class:`StepSpec` from ``step(fn, when=...)``. ``meta`` is ``None`` when the
-    function carries no ``@step`` config, which the caller reads as "use the
-    defaults".
-    """
-    if not isinstance(item, StepSpec):
-        return item, step_meta(item), None
-
-    meta = step_meta(item.fn)
-    if item.max_attempts is not None or item.backoff is not None:
-        # Values given to `step(...)` at the call site beat the decorator's:
-        # the pipeline is the more specific context.
-        meta = StepMeta(
-            max_attempts=(
-                item.max_attempts
-                if item.max_attempts is not None
-                else (meta.max_attempts if meta else defaults.max_attempts)
-            ),
-            backoff=item.backoff if item.backoff is not None else (meta.backoff if meta else defaults.backoff),
-        )
-    return item.fn, meta, item.when
-
-
-def _retry(meta: StepMeta | None, defaults: RuntimeConfig) -> tuple[int, tuple[float, ...]]:
-    """A step's retry contract: its own if it declared one, else the engine's.
-
-    An undecorated step used to fall back to a pair of module constants, which
-    meant `RuntimeConfig(max_attempts=7)` configured nothing — the value was read
-    nowhere and every step still got 3.
-    """
-    if meta is None:
-        return defaults.max_attempts, defaults.backoff
-    return meta.max_attempts, meta.backoff
-
-
 def compile_scheduled(
     fn: NodeFn,
     *,
@@ -91,7 +46,6 @@ def compile_scheduled(
     enabled: bool = True,
     defaults: RuntimeConfig | None = None,
 ) -> WorkflowDefinition:
-    """Compile one async function into a single-step workflow on a cron."""
     resolved = defaults or RuntimeConfig()
     max_attempts, backoff = _retry(step_meta(fn), resolved)
     return WorkflowDefinition(
@@ -121,12 +75,6 @@ def compile_pipeline(
     state_cls: type | None = None,
     defaults: RuntimeConfig | None = None,
 ) -> WorkflowDefinition:
-    """Compile a class with a ``steps`` list into an ordered workflow.
-
-    Each entry is a callable or a :class:`StepSpec`. A spec's ``when`` guard
-    becomes :attr:`NodeDef.when_fn`; the executor evaluates it against the
-    current state and skips the step without breaking the chain.
-    """
     steps: list[Any] = list(getattr(cls, "steps", []))
     if not steps:
         raise BadRequestError(f"pipeline {name!r} v{version}: class {cls.__name__} declares no steps")
@@ -168,3 +116,28 @@ def compile_pipeline(
         reducers=reducers,
         schedule=cron,
     )
+
+
+def _resolve_step(item: NodeFn | StepSpec, defaults: RuntimeConfig) -> tuple[NodeFn, StepMeta | None, WhenFn | None]:
+    if not isinstance(item, StepSpec):
+        return item, step_meta(item), None
+
+    meta = step_meta(item.fn)
+    if item.max_attempts is not None or item.backoff is not None:
+        # Values given to `step(...)` at the call site beat the decorator's:
+        # the pipeline is the more specific context.
+        meta = StepMeta(
+            max_attempts=(
+                item.max_attempts
+                if item.max_attempts is not None
+                else (meta.max_attempts if meta else defaults.max_attempts)
+            ),
+            backoff=item.backoff if item.backoff is not None else (meta.backoff if meta else defaults.backoff),
+        )
+    return item.fn, meta, item.when
+
+
+def _retry(meta: StepMeta | None, defaults: RuntimeConfig) -> tuple[int, tuple[float, ...]]:
+    if meta is None:
+        return defaults.max_attempts, defaults.backoff
+    return meta.max_attempts, meta.backoff

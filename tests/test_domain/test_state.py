@@ -86,3 +86,19 @@ def test_unresolvable_annotations_fall_back_to_last_write_wins():
         field: "SomeTypeThatDoesNotExist"  # noqa: F821
 
     assert extract_reducers(Broken) == {}
+
+
+def test_a_reducer_survives_an_unresolvable_sibling_annotation() -> None:
+    """`get_type_hints` raises for the whole class when one name is only
+    imported under TYPE_CHECKING — the house style everywhere — so the fallback
+    read raw string annotations, matched no `Annotated`, and silently turned
+    every accumulator into last-write-wins."""
+    from tests.test_domain import _deferred_state
+
+    reducers = extract_reducers(_deferred_state.DeferredState)
+
+    assert reducers.get("logs") is operator.add, "the resolvable reducer was discarded with its sibling"
+    assert "started" not in reducers
+
+    merged = apply_state_update({"logs": ["first"]}, {"logs": ["second"]}, reducers)
+    assert merged["logs"] == ["first", "second"]

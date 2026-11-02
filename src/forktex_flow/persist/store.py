@@ -21,14 +21,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""``FlowStore`` — the database handle every persistence function takes.
-
-This is what replaced passing ``Flow`` itself down the stack. Every function in
-``persist``, ``read`` and ``runtime`` used to accept the whole engine in order to
-reach two of its attributes, which made each lower layer import the facade for
-its type and inverted the package's dependency direction. A store holds exactly
-what a write needs: a pool and the schema it writes to.
-"""
 
 from __future__ import annotations
 
@@ -40,27 +32,28 @@ if TYPE_CHECKING:
     from forktex.database import Database
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-__all__ = ["FlowStore"]
+__all__ = ["FlowStore", "rowcount"]
+
+
+def rowcount(result: object) -> int:
+    """How many rows an UPDATE touched. Every backend this library targets supports ``rowcount`` on an UPDATE, but
+    pyright's stub does not expose it on the base ``Result`` type, so the access needs a typed fallback.
+    """
+    return getattr(result, "rowcount", 0) or 0
 
 
 @dataclass(frozen=True, slots=True)
 class FlowStore:
-    """A pool plus the schema its statements resolve against.
-
-    ``database`` is a ``forktex.database.Database`` whose
-    ``schema_translate_map`` rewrites the literal ``forktex_flow`` in the ORM
-    models to ``schema``. The two are carried together because using one without
-    the other silently writes to the wrong schema.
-    """
-
     database: Database
     schema: str
 
     def session(self) -> AbstractAsyncContextManager[AsyncSession]:
-        """A transactional session: commits on success, rolls back on error."""
-        return self.database.session()
+        """One transaction per block: commits on clean exit, rolls back on error. Callers do not commit —
+        ``transactional_session`` owns the boundary and raises ``TransactionBoundaryError`` on
+        ``commit``/``rollback``/``begin``, so a write-without-commit cannot be introduced.
+        """
+        return self.database.transactional_session()
 
     @property
     def engine(self) -> AsyncEngine:
-        """The underlying engine — for DDL, advisory locks and migrations."""
         return self.database.engine

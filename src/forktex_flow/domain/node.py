@@ -21,13 +21,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""The ``@step`` decorator and the spec it produces.
-
-``step`` is deliberately dual-mode. Bare ``@step`` attaches a retry contract to
-the function and returns it unchanged, so a step is still an ordinary callable a
-test can await directly. ``step(fn, when=...)`` instead returns a
-:class:`StepSpec` for use inside a pipeline's ``steps`` list. The two forms
-cannot be confused because the second requires ``fn`` positionally.
+"""The ``@step`` decorator and the spec it produces. The two forms cannot be confused: the second requires ``fn``
+positionally.
 """
 
 from __future__ import annotations
@@ -53,20 +48,11 @@ _DEFAULTS = RuntimeConfig()
 
 
 class StepMeta(BaseValueObject):
-    """Retry + backoff configuration stored on the function itself.
-
-    The executor reads it via :func:`step_meta` at dispatch time. Storing it on
-    the function rather than in a registry means the function carries its own
-    durability contract and works with any ``Flow`` without prior registration.
-    """
-
     max_attempts: int
     backoff: tuple[float, ...]
 
 
 class StepSpec(BaseValueObject):
-    """Returned by ``step(fn, when=...)`` for use in a pipeline's ``steps`` list."""
-
     fn: Callable[..., Any]
     when: Callable[[dict[str, Any]], bool] | None = None
     max_attempts: int | None = None
@@ -74,19 +60,11 @@ class StepSpec(BaseValueObject):
 
 
 def step_meta(fn: object) -> StepMeta | None:
-    """Return the :class:`StepMeta` attached by :func:`step`, or ``None``.
-
-    ``None`` is a legitimate result, not a broken invariant: the compilers
-    accept bare, undecorated callables and fall back to the default retry
-    config. The typed accessor centralises the attribute name and gives call
-    sites a precise return type without a per-site ``type: ignore``.
-    """
     meta = getattr(fn, _STEP_META_ATTR, None)
     return meta if isinstance(meta, StepMeta) else None
 
 
 def has_step_meta(fn: object) -> bool:
-    """True if ``fn`` was decorated with :func:`step`."""
     return isinstance(getattr(fn, _STEP_META_ATTR, None), StepMeta)
 
 
@@ -129,14 +107,7 @@ def step(
     backoff: tuple[float, ...] | None = None,
     when: Callable[[dict[str, Any]], bool] | None = None,
 ) -> Callable[..., Any] | StepSpec:
-    """Attach a retry contract to a step, or build a guarded pipeline entry.
-
-    As a decorator — ``@step`` or ``@step(max_attempts=5)`` — attaches
-    :class:`StepMeta` and returns ``fn`` unchanged.
-
-    As a pipeline entry — ``step(fn, when=predicate)`` — returns a
-    :class:`StepSpec`. ``fn`` must be positional.
-    """
+    """Attach a retry contract to a step, or build a guarded pipeline entry. ``fn`` must be positional."""
     resolved_max_attempts = max_attempts if max_attempts is not None else _DEFAULTS.max_attempts
     resolved_backoff = backoff if backoff is not None else _DEFAULTS.backoff
 

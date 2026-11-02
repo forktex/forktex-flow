@@ -21,17 +21,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Flow's vocabulary: frozen value objects and the declarative workflow shapes.
-
-The bottom of the package's DAG — nothing here imports anything else from
-`forktex_flow`, and nothing here performs I/O. A reader can learn what a workflow
-*is* from this layer alone, without meeting a session or an engine.
-
-Four modules, split by what they describe: `types` the run/step row shapes and
-statuses, `definition` the compiled workflow (an ordered list of steps), `node`
-the authoring decorator, and `state` the reducer that merges a step's partial
-update into the run state.
-"""
+"""Flow's vocabulary: frozen value objects and the declarative workflow shapes."""
 
 from forktex_flow.domain.definition import (
     NodeDef,

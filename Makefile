@@ -38,12 +38,10 @@ test: ## Automated tests verify behaviour, with a coverage floor
 	@# drifts: the driver and heartbeat loops are timing-dependent, so a future
 	@# test touching them could legitimately vary by a few statements, and a gate
 	@# that fails at random is one people learn to re-run rather than read.
-	@# Note: the term report ROUNDS, so it prints 97% while --cov-fail-under
-	@# compares the exact figure. Read the number, not the printed percentage.
 	@# Integration tests use a real Postgres via testcontainers — Docker must be
 	@# running. There are no mocks for it.
 	poetry run python3 -m pytest tests/ -q --cov=src/forktex_flow \
-		--cov-report=term-missing --cov-fail-under=$(COVERAGE_FLOOR)
+		--cov-report=term-missing --cov-precision=2 --cov-fail-under=$(COVERAGE_FLOOR)
 
 audit: ## Scan the project venv for known CVEs in installed deps
 	poetry run python3 -m pip_audit --skip-editable --timeout 30
@@ -105,7 +103,13 @@ clean: ## Build artifacts and caches removable from project tree
 release-check: ## Version, tag and CHANGELOG agree (pass TAG=v0.1.0 to check a tag)
 	poetry run python3 scripts/release_check.py $(TAG)
 
+lock-check: ## The lock file resolves the current pyproject.toml
+	@# `make ci` runs against the installed venv, so only this catches a
+	@# pyproject.toml edit that was never locked — which CI fails on first.
+	poetry check --lock
+
 ci: ## Aggregate quality gate before publish
+	@$(MAKE) lock-check
 	@$(MAKE) parse-check
 	@$(MAKE) format-check
 	@$(MAKE) lint
@@ -119,5 +123,5 @@ ci: ## Aggregate quality gate before publish
 	@echo ''
 	@echo 'CI passed for $(PROJECT_NAME) — safe to: make publish-test  /  make publish'
 
-.PHONY: help parse-check format format-check lint lint-fix typecheck test audit \
+.PHONY: help lock-check parse-check format format-check lint lint-fix typecheck test audit \
 	license-check license-fix install build smoke release-check publish-test publish clean ci

@@ -21,13 +21,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""ORM row → domain value object.
-
-Both mappers live here rather than in the aggregate that owns the table, because
-`to_run_info` embeds the step list: keeping them together is what stops `runs` and `steps`
-importing each other's privates. The direction is one-way — persist knows about domain,
-never the reverse.
-"""
+"""ORM row → domain value object. The direction is one-way — persist knows about domain, never the reverse."""
 
 from __future__ import annotations
 

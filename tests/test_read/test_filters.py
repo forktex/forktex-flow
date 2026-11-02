@@ -85,7 +85,6 @@ async def test_triggered_by_separates_manual_runs_from_scheduled_ones(flow: Flow
     await driver._fire_due_schedules()
     async with flow.session() as session:
         await session.execute(update(ScheduledRun).values(next_fire_at=datetime.now(UTC) - timedelta(minutes=5)))
-        await session.commit()
     await driver._fire_due_schedules()
 
     assert await flow.query().triggered_by("manual").count() == 1
@@ -95,6 +94,10 @@ async def test_triggered_by_separates_manual_runs_from_scheduled_ones(flow: Flow
 
 @pytest.mark.asyncio
 async def test_since_and_until_bound_the_window(flow: Flow):
+    """The boundary is inclusive on `since` and exclusive on `until`, so one run
+    either side of a timestamp is matched by exactly one of them, and by their
+    intersection only on the later side.
+    """
     await _register(flow)
     await flow.run("t.filter", state={})
     boundary = datetime.now(UTC)
@@ -119,7 +122,7 @@ async def test_current_node_finds_runs_stopped_inside_a_named_step(flow: Flow):
 
     from forktex_flow.persist import steps as _steps
 
-    step_id, _, _ = await _steps.upsert_pending_step(
+    slot = await _steps.upsert_pending_step(
         flow._store,
         run_id=instance.instance_id,
         step_name="slow",
@@ -128,6 +131,8 @@ async def test_current_node_finds_runs_stopped_inside_a_named_step(flow: Flow):
         args_hash="h",
         max_attempts=3,
     )
+
+    step_id = slot.step_id
     await _steps.mark_step_running(flow._store, step_id)
 
     assert await flow.query().current_node("slow").count() == 1
@@ -222,7 +227,7 @@ async def test_current_node_matches_the_step_name_exactly(flow: Flow):
     flow.pipeline("t.exact", version=1, state=State)(type("W", (), {"steps": [validate_input]}))
     instance = await flow.run("t.exact", state={})
 
-    step_id, _, _ = await _steps.upsert_pending_step(
+    slot = await _steps.upsert_pending_step(
         flow._store,
         run_id=instance.instance_id,
         step_name="validate_input",
@@ -231,6 +236,8 @@ async def test_current_node_matches_the_step_name_exactly(flow: Flow):
         args_hash="h",
         max_attempts=3,
     )
+
+    step_id = slot.step_id
     await _steps.mark_step_running(flow._store, step_id)
 
     assert await flow.query().current_node("validate_input").count() == 1

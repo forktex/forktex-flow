@@ -21,11 +21,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Flow's read layer: the fluent finder and the SQL it compiles to.
-
-`instance` is the user-facing surface (`InstanceQuery`, `WorkflowInstance`);
-`query` compiles a `RunFilter` into SQL and maps rows onto a page. Split because
-one is a vocabulary a consumer holds and the other is machinery it never sees.
+"""Flow's read layer: the fluent finder and the SQL it compiles to. Split along what a consumer holds: a
+vocabulary, versus machinery it never sees.
 """
 
 from forktex_flow.read.instance import (

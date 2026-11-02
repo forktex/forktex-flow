@@ -33,6 +33,9 @@ These are that guard, rebuilt against the layout this package actually has.
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
+import textwrap
 import pathlib
 
 import pytest
@@ -65,7 +68,7 @@ def _imported_layer(module: str) -> str | None:
     parts = module.split(".")
     if parts[0] != "forktex_flow" or len(parts) < 2:
         return None
-    return parts[1] if parts[1] in LAYERS else parts[1]
+    return parts[1]
 
 
 def _internal_imports(path: pathlib.Path) -> list[tuple[int, str]]:
@@ -179,3 +182,41 @@ def test_cycle_debt_is_zero():
                         if alias.name.startswith("forktex_flow")
                     )
     assert debt == [], "function-local self-imports (cycle debt) must stay at 0:\n  " + "\n  ".join(debt)
+
+
+def test_importing_the_package_pulls_in_nothing_it_does_not_need():
+    """`forktex` resolves its modules on first access, so a consumer importing
+    this package should pay for Postgres and nothing else. An import added
+    inside a module body is the usual way a web framework or an S3 client
+    arrives here without anyone deciding it should.
+
+    Run in a subprocess: this suite has already imported everything.
+    """
+    probe = textwrap.dedent("""
+        import sys
+        import forktex_flow  # noqa: F401
+        unwanted = {"fastapi", "starlette", "aioboto3", "botocore", "boto3", "redis", "qdrant_client"}
+        print(",".join(sorted({m.split(".")[0] for m in sys.modules} & unwanted)))
+    """)
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    pulled = [name for name in result.stdout.strip().split(",") if name]
+    assert pulled == [], f"importing forktex_flow pulled in {pulled}"
+
+
+def test_the_package_imports_only_the_forktex_modules_it_uses():
+    """A new `from forktex.x import ...` is a new dependency edge. The engine
+    needs `database`, `error`, `iso`, `log` and `types`; anything else is either
+    a mistake or a decision to record here.
+    """
+    allowed = {"database", "error", "iso", "log", "types"}
+    used: set[str] = set()
+    for path in SRC.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("forktex."):
+                used.add(node.module.split(".")[1])
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("forktex.") and not alias.name.startswith("forktex_flow"):
+                        used.add(alias.name.split(".")[1])
+    unexpected = sorted(used - allowed)
+    assert unexpected == [], f"src/ reaches for forktex modules outside the declared set: {unexpected}"

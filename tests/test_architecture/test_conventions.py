@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import pathlib
 
 import pytest
@@ -120,13 +121,10 @@ def test_src_carries_no_lint_exemptions_except_the_documented_one():
     found: list[str] = []
     for path in _files():
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            # An actual trailing pragma, not the phrase appearing in prose:
-            # a docstring explaining why a helper exists "without a per-site
-            # type: ignore" is the opposite of an exemption.
             stripped = line.split("#", 1)[-1].strip() if "#" in line else ""
             if stripped.startswith(("noqa", "type: ignore")):
-                found.append(f"{path.relative_to(SRC)}:{lineno}")
-    assert found == ["flow.py:143"], f"unexpected lint exemptions in src/: {found}"
+                found.append(str(path.relative_to(SRC)))
+    assert found == ["flow.py"], f"unexpected lint exemptions in src/: {found}"
 
 
 @pytest.mark.parametrize("path", _files(), ids=lambda p: str(p.relative_to(SRC)))
@@ -171,34 +169,239 @@ def test_no_docstring_contains_a_declaration():
                 continue
             for lineno, line in enumerate(doc.splitlines(), 1):
                 stripped = line.strip()
-                if stripped.startswith(("__all__", "import ", "from ")) and " import " not in stripped[:5]:
+                if _is_declaration(stripped):
                     name = getattr(node, "name", "<module>")
                     offenders.append(f"{path.relative_to(SRC)} in {name}() docstring line {lineno}: {stripped[:50]}")
     assert offenders == [], "a declaration is buried in a docstring:\n  " + "\n  ".join(offenders)
 
 
-def test_the_status_vocabulary_agrees_across_its_three_homes():
-    """`RunStatus`, the ORM's CHECK constraint, and the migration SQL.
+def _is_declaration(line: str) -> bool:
+    """Whether a docstring line parses as an import or an `__all__` assignment.
 
-    Three restatements of one list, and they must agree. They cannot be reduced
-    to one: the SQL is frozen byte-for-byte by
-    `test_migration_immutability.py`, correctly — an applied migration is never
-    edited — so the Python side cannot generate it. What can be done is refuse
-    to let them drift, which is what this asserts. The same shape of duplication
-    (retry defaults in three places) already shipped a real defect.
+    Matching on a prefix cannot tell a declaration from prose that happens to
+    begin with one of these words — "import direction a layered package
+    forbids" is a sentence. Parsing it answers exactly.
+    """
+    try:
+        parsed = ast.parse(line)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Import | ast.ImportFrom)
+        or (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets))
+        for node in parsed.body
+    )
+
+
+def test_the_status_vocabulary_agrees_with_the_migration():
+    """`RunStatus` and the CHECK constraint in the migration.
+
+    The ORM's constraint is rendered from `RunStatus`, so those two cannot
+    drift. The SQL cannot be generated from it — an applied migration is frozen
+    byte-for-byte by `test_migration_immutability.py`, correctly — so adding a
+    status to the type needs an incremental migration, and this is what says so
+    before the database rejects a row.
     """
     import re
     from typing import get_args
 
     from forktex_flow.domain.types import RunStatus
-    from forktex_flow.persist.models import _STATUSES
 
     declared = set(get_args(RunStatus))
-    assert set(_STATUSES) == declared, f"persist/models._STATUSES disagrees with RunStatus: {_STATUSES}"
 
-    sql = (SRC / "persist" / "migrations" / "v0001__schema.sql").read_text(encoding="utf-8")
+    # Every migration, not a named one: the baseline is a file per table, so
+    # the status constraints live in whichever files declare a status column.
+    sql = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted((SRC / "persist" / "migrations").glob("v*.sql"))
+    )
     checks = re.findall(r"CHECK \(status IN \(([^)]*)\)\)", sql)
-    assert checks, "no status CHECK constraint found in the migration"
+    assert checks, "no status CHECK constraint found in any migration"
     for clause in checks:
         in_sql = {value.strip().strip("'") for value in clause.split(",")}
         assert in_sql == declared, f"a migration CHECK disagrees with RunStatus: {sorted(in_sql)}"
+
+
+def test_a_module_declares_its_public_surface_before_its_helpers():
+    """`package-layout:public-first`. A reader opening a module meets what it
+    offers before what it needs to offer it. Private helpers interleaved with
+    the public surface also hide whether a name is API or scaffolding.
+    """
+    offenders: list[str] = []
+    for path in _files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        first_private: str | None = None
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                continue
+            if node.name.startswith("_") and not node.name.startswith("__"):
+                first_private = first_private or node.name
+            elif first_private and not node.name.startswith("_"):
+                offenders.append(
+                    f"{path.relative_to(SRC)}: public `{node.name}` is defined after private `{first_private}`"
+                )
+                break
+    assert offenders == [], "public surface must come first:\n  " + "\n  ".join(offenders)
+
+
+_DOC_STOPWORDS = frozenset(
+    "the a an of for to this it its and or on in from with that is are was one by as into at be "
+    "not no their which".split()
+)
+
+
+def test_no_docstring_merely_restates_the_name_it_sits_on():
+    """A docstring earns its place by saying something the name and signature do
+    not. One that paraphrases the name is noise a reader has to read past, and
+    it is worse than no docstring: it looks like documentation.
+
+    A declaration whose name and signature already say everything is left bare
+    on purpose — that is why this asserts the absence of restatement rather than
+    the presence of a docstring.
+    """
+    offenders: list[str] = []
+    for path in _files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                continue
+            doc = ast.get_docstring(node)
+            if not doc:
+                continue
+            opening = doc.strip().split("\n\n")[0].replace("\n", " ")
+            content = [w for w in re.findall(r"[a-z]+", opening.lower()) if w not in _DOC_STOPWORDS]
+            if not content or len(content) > 9:
+                continue
+            from_name = set(re.findall(r"[a-z]+", node.name.lower()))
+            echoes = sum(
+                1
+                for w in content
+                if w in from_name or any(w.startswith(part[:4]) for part in from_name if len(part) > 3)
+            )
+            if echoes / len(content) >= 0.6:
+                offenders.append(f"{path.relative_to(SRC)}::{node.name}: {opening!r}")
+    assert offenders == [], "these docstrings restate their own name:\n  " + "\n  ".join(offenders)
+
+
+def test_an_overload_stub_carries_no_docstring():
+    """`@overload` stubs exist for the type checker. The implementation holds the
+    documentation; a copy on each stub is the same text three times, and they
+    drift apart one edit later.
+    """
+    offenders: list[str] = []
+    for path in _files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            decorators = {ast.unparse(d) for d in node.decorator_list}
+            if "overload" in decorators and ast.get_docstring(node):
+                offenders.append(f"{path.relative_to(SRC)}::{node.name}")
+    assert offenders == [], "an @overload stub carries a docstring:\n  " + "\n  ".join(offenders)
+
+
+_TESTS = pathlib.Path(__file__).resolve().parents[1]
+
+
+def test_a_test_whose_body_outgrows_its_name_says_what_it_pins():
+    """Most tests here are named as a sentence, and a docstring on top of that
+    would restate it — so the convention is a descriptive name and no docstring.
+    That holds only while the name still covers the body. Two shapes break it:
+    a name too terse to say anything (`test_metadata_containment_filters` over
+    six statements), and a body large enough that its setup establishes
+    something the name never mentions (`test_since_and_until_bound_the_window`
+    over eight). Both are calibrated against those two, and the threshold has to
+    stay above the many 6-statement tests whose sentence names do cover them —
+    a docstring there would restate the name, which the gate above forbids.
+    """
+    offenders: list[str] = []
+    for path in sorted(_TESTS.rglob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if not node.name.startswith("test_") or ast.get_docstring(node):
+                continue
+            statements = [n for n in node.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+            words = len(node.name.removeprefix("test_").split("_"))
+            terse_name = words <= 4 and len(statements) >= 5
+            large_body = len(statements) >= 8 and words <= 6
+            if terse_name or large_body:
+                offenders.append(
+                    f"{path.relative_to(_TESTS)}::{node.name} ({len(statements)} statements, {words}-word name)"
+                )
+    assert offenders == [], "these tests need a docstring or a longer name:\n  " + "\n  ".join(offenders)
+
+
+#: A docstring in `src/` survives only by saying one of these — what the call
+#: raises or guarantees, when a hook fires, or that something is internal.
+#: Anything else belongs in `docs/`, which the pages already carry.
+_STATES_A_CONTRACT = re.compile(
+    r"\b(rais(e|es|ed)|idempotent|returns?\s+(``?)?(False|True|None)|not durable|not an error|"
+    r"never|must |no-op|does not|cannot|safe (to|before)|refus(e|es)|declin(e|es|ed)|append-only|"
+    r"unguarded|mutates|internal|positionally|called once)\b",
+    re.I,
+)
+
+
+def test_every_docstring_states_a_contract_rather_than_describing_the_code():
+    """`docs:essential-only`. The reference package for this codebase carries
+    almost no docstrings: semantics live in `docs/`, and the code is read as
+    code. A docstring here earns its place by stating what a caller cannot see
+    from the name and signature — what it raises, what it guarantees, when a
+    hook fires.
+
+    A package `__init__` is exempt: `test_public_surface.py` requires one. An
+    error class is exempt: its docstring *is* the raised-when condition.
+    """
+    offenders: list[str] = []
+    for path in _files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        is_package = path.name == "__init__.py"
+        errors = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and any("Error" in ast.unparse(b) or "Flow" in ast.unparse(b) for b in node.bases)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            doc = ast.get_docstring(node)
+            if not doc:
+                continue
+            if is_package and isinstance(node, ast.Module):
+                continue
+            if isinstance(node, ast.ClassDef) and node.name in errors and path.name == "errors.py":
+                continue
+            if not _STATES_A_CONTRACT.search(doc):
+                offenders.append(f"{path.relative_to(SRC)}::{getattr(node, 'name', '<module>')}")
+    assert offenders == [], (
+        "these docstrings describe the code instead of stating a contract — "
+        "delete them, or move what they say to docs/:\n  " + "\n  ".join(offenders)
+    )
+
+
+#: Raising the base class says "our invariant broke", and `FlowError` carries
+#: `INTERNAL` for that reason. Every other condition gets the leaf that names
+#: it. Each entry here is a deliberate invariant check, not a shortcut.
+_BASE_ERROR_RAISES = {"runtime/driver.py"}
+
+
+def test_the_base_error_is_raised_only_where_an_invariant_broke():
+    """`errors:name-the-condition`. A caller distinguishes outcomes by error
+    class, so a bare `FlowError` where a leaf exists reports "the server is
+    broken" for something the caller could have handled.
+    """
+    found: set[str] = set()
+    for path in _files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Raise) or node.exc is None:
+                continue
+            raised = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+            if ast.unparse(raised) == "FlowError":
+                found.add(str(path.relative_to(SRC)))
+    unexpected = sorted(found - _BASE_ERROR_RAISES)
+    assert unexpected == [], "the base error is raised where a leaf should name the condition: " + ", ".join(unexpected)
+    stale = sorted(_BASE_ERROR_RAISES - found)
+    assert stale == [], f"this allowlist names files that no longer raise FlowError: {stale}"

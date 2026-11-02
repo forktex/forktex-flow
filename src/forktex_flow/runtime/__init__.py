@@ -21,16 +21,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Flow's execution machinery — the part that actually runs a workflow.
-
-`compiler` turns a decorated function or class into a definition, `registry`
-holds what has been declared, `execution` is the durable step boundary that
-makes a re-run idempotent, `ctx` is the handle a step body is given, `driver` is
-the leader-elected loop that claims and advances runs, and `context` bundles
-what all of them need.
-
-Depends on `persist`, `read` and `domain`. Nothing below imports back up into
-it, and nothing here imports the facade.
+"""Flow's execution machinery — the part that actually runs a workflow. `compiler` turns a decorated function or
+class into a definition, `registry` holds what has been declared, `execution` is the durable step boundary that
+makes a re-run idempotent, `ctx` is the handle a step body is given, `driver` is the leader-elected loop that
+claims and advances runs, and `context` bundles what all of them need.
 """
 
 from forktex_flow.runtime.compiler import compile_pipeline, compile_scheduled

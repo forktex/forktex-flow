@@ -21,19 +21,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Exception hierarchy for ``forktex_flow``.
-
-Every public class here is an ``AppError`` subclass, so a transport that already
-knows how to render an ``AppError`` — notably ``forktex.api``'s error-envelope
-middleware — renders these too, with the right code instead of a masked 500.
-Each leaf sets the ``code`` that carries its meaning; ``AppError.__init__(message,
-*, details=None)`` is inherited unchanged.
-
-Two of these are internal control flow rather than reportable failures
-(:class:`StepClaimLost`, :class:`StepRetryRequested`). They live here anyway,
-because a reader looking for "what can this package raise" must find all of it in
-one file, and they are kept out of ``__all__`` so they are not part of the
-published surface.
+"""Exception hierarchy for ``forktex_flow``. Two are internal control flow rather than reportable failures, and are
+kept out of ``__all__``: a reader looking for "what can this package raise" still finds all of it in one file.
 """
 
 from __future__ import annotations
@@ -42,60 +31,45 @@ from forktex.error import AppError, AppErrorCode
 
 
 class FlowError(AppError):
-    """Base for any error originating from the flow library itself —
-    registration, schema, driver, execution. Distinct from errors raised by user
-    step code, which the library captures as :class:`StepFailed`."""
+    """Base for any error the library itself raises."""
 
     code = AppErrorCode.INTERNAL
 
 
 class StepFailed(FlowError):
-    """A step's body raised an exception that exhausted its retries.
-
-    The original cause is chained via ``__cause__``. The step's row in
-    ``forktex_flow.step_run`` carries the truncated traceback and the final
-    attempt count.
-
-    ``FAILED`` rather than ``INTERNAL``: the workflow failing is a real outcome
-    the caller may need to distinguish from the server breaking.
-    """
+    """A step's body raised an exception that exhausted its retries."""
 
     code = AppErrorCode.FAILED
 
 
 class WorkflowFailed(FlowError):
-    """A run reached terminal ``failed`` status, typically because a step inside
-    it raised :class:`StepFailed`. Surfaced from ``WorkflowInstance.wait()`` for
-    callers that want a synchronous result."""
+    """A run reached terminal ``failed``. Surfaced from ``WorkflowInstance.wait()``."""
 
     code = AppErrorCode.FAILED
 
 
 class WorkflowCancelled(FlowError):
-    """A run was cancelled through ``WorkflowInstance.cancel()``."""
-
     code = AppErrorCode.CANCELLED
 
 
 class StepClaimLost(FlowError):
-    """A worker tried to advance a step row it no longer owns.
-
-    Raised when the conditional claim update matches no row — another worker
-    reclaimed the step after this one's heartbeat went stale. The correct
-    response is to abandon the attempt silently, not to fail the run: the step
-    is already running somewhere else. Internal; not exported.
-    """
+    """A worker tried to advance a step row it no longer owns. Internal."""
 
     code = AppErrorCode.CONFLICT
 
 
-class StepRetryRequested(FlowError):
-    """A step body failed with retries remaining.
+class FlowClosed(FlowError):
+    code = AppErrorCode.FAILED
 
-    Control flow, not a report: the executor catches it, marks the run
-    ``pending``, and the driver re-picks it after the step's backoff window.
-    Internal; not exported.
-    """
+
+class StateNotSerialisable(FlowError):
+    """A state value cannot be written to JSONB."""
+
+    code = AppErrorCode.VALIDATION
+
+
+class StepRetryRequested(FlowError):
+    """A step body failed with retries remaining. Control flow, internal."""
 
     code = AppErrorCode.FAILED
 

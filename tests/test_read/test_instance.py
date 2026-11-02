@@ -25,30 +25,21 @@
 
 from __future__ import annotations
 
-import operator
-from typing import Annotated, TypedDict
 
 import pytest
+
+from tests.conftest import LoggingState, runtime_for
 from forktex.error import NotFoundError
 
 from forktex_flow import Ctx, Flow, WorkflowInstance
-from forktex_flow.runtime.context import FlowRuntime
 from forktex_flow.runtime.execution import execute_run
 
 
-class State(TypedDict, total=False):
-    logs: Annotated[list[str], operator.add]
-
-
 async def _register(flow: Flow) -> None:
-    async def work(ctx: Ctx, state: State) -> dict:
+    async def work(ctx: Ctx, state: LoggingState) -> dict:
         return {"logs": ["done"]}
 
-    flow.pipeline("t.instance", version=1, state=State)(type("W", (), {"steps": [work]}))
-
-
-def _runtime(flow: Flow) -> FlowRuntime:
-    return FlowRuntime(flow._store, flow._registry, flow._config, flow.extensions)
+    flow.pipeline("t.instance", version=1, state=LoggingState)(type("W", (), {"steps": [work]}))
 
 
 @pytest.mark.asyncio
@@ -57,7 +48,7 @@ async def test_refresh_reflects_work_done_since_the_snapshot(flow: Flow):
     instance = await flow.run("t.instance", state={"logs": []})
     assert instance.status == "pending"
 
-    await execute_run(_runtime(flow), instance.instance_id, "t.instance", 1)
+    await execute_run(runtime_for(flow), instance.instance_id, "t.instance", 1)
 
     assert (await instance.refresh()).status == "completed"
     assert instance.status == "pending", "refresh returns a new snapshot; it does not mutate the old one"
@@ -67,7 +58,7 @@ async def test_refresh_reflects_work_done_since_the_snapshot(flow: Flow):
 async def test_wait_returns_immediately_on_an_already_terminal_run(flow: Flow):
     await _register(flow)
     instance = await flow.run("t.instance", state={"logs": []})
-    await execute_run(_runtime(flow), instance.instance_id, "t.instance", 1)
+    await execute_run(runtime_for(flow), instance.instance_id, "t.instance", 1)
 
     final = await instance.wait(timeout=5)
     assert final.status == "completed"
@@ -100,7 +91,7 @@ async def test_stream_ends_on_the_terminal_snapshot(flow: Flow):
     learn how the run ended, so the terminal snapshot is always emitted."""
     await _register(flow)
     instance = await flow.run("t.instance", state={"logs": []})
-    await execute_run(_runtime(flow), instance.instance_id, "t.instance", 1)
+    await execute_run(runtime_for(flow), instance.instance_id, "t.instance", 1)
 
     snapshots = [snapshot async for snapshot in instance.stream()]
     assert snapshots

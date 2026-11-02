@@ -37,7 +37,7 @@ DNS record a human still has to create, an approval gate holding a deploy until
 someone reads the plan — was really an unadvertised twelve-minute timeout, plus
 720 pointless round-trips at whatever the step was polling.
 
-``_revive_runs_with_pending_steps`` already gated on the due time, which is why
+``_revive_abandoned_runs`` already gated on the due time, which is why
 this looked correct on a reading: that sweep is for runs stuck at ``running``,
 and a retrying run never passes through it.
 """
@@ -71,7 +71,7 @@ async def _pending_run(flow: Flow, name: str):
 
 async def _schedule_retry(flow: Flow, run_id, *, seconds: int) -> None:
     """Put the run in the state a retrying step leaves behind."""
-    step_id, _, _ = await _steps.upsert_pending_step(
+    slot = await _steps.upsert_pending_step(
         flow._store,
         run_id=run_id,
         step_name="noop",
@@ -80,10 +80,11 @@ async def _schedule_retry(flow: Flow, run_id, *, seconds: int) -> None:
         args_hash="h",
         max_attempts=720,
     )
+    step_id = slot.step_id
+    await _steps.mark_step_running(flow._store, step_id)
     await _steps.mark_step_failed(flow._store, step_id, "boom", final=False, retry_in_seconds=seconds)
     async with flow.session() as session:
         await session.execute(sa.update(Run).where(Run.id == run_id).values(status="pending"))
-        await session.commit()
 
 
 @pytest.mark.asyncio
@@ -94,7 +95,7 @@ async def test_a_run_waiting_on_a_backoff_is_not_claimed(flow: Flow):
 
     claimed = await _runs.claim_pending_runs(flow._store, limit=10)
 
-    assert instance.instance_id not in {run_id for run_id, _, _ in claimed}
+    assert instance.instance_id not in {c.run_id for c in claimed}
 
 
 @pytest.mark.asyncio
@@ -114,11 +115,10 @@ async def test_it_is_claimed_once_the_backoff_has_elapsed(flow: Flow):
             .where(StepRun.run_id == instance.instance_id)
             .values(next_attempt_at=sa.func.now() - timedelta(seconds=1))
         )
-        await session.commit()
 
     claimed = await _runs.claim_pending_runs(flow._store, limit=10)
 
-    assert instance.instance_id in {run_id for run_id, _, _ in claimed}
+    assert instance.instance_id in {c.run_id for c in claimed}
 
 
 @pytest.mark.asyncio
@@ -132,7 +132,7 @@ async def test_a_fresh_run_with_no_steps_is_still_claimed(flow: Flow):
 
     claimed = await _runs.claim_pending_runs(flow._store, limit=10)
 
-    assert instance.instance_id in {run_id for run_id, _, _ in claimed}
+    assert instance.instance_id in {c.run_id for c in claimed}
 
 
 @pytest.mark.asyncio
@@ -143,7 +143,7 @@ async def test_a_run_between_steps_is_still_claimed(flow: Flow):
     backoff guard silently becomes a deadlock for every multi-step workflow.
     """
     instance = await _pending_run(flow, "t.backoff.between")
-    step_id, _, _ = await _steps.upsert_pending_step(
+    slot = await _steps.upsert_pending_step(
         flow._store,
         run_id=instance.instance_id,
         step_name="noop",
@@ -152,14 +152,15 @@ async def test_a_run_between_steps_is_still_claimed(flow: Flow):
         args_hash="h",
         max_attempts=3,
     )
+    step_id = slot.step_id
+    await _steps.mark_step_running(flow._store, step_id)
     await _steps.mark_step_completed(flow._store, step_id, {})
     async with flow.session() as session:
         await session.execute(sa.update(Run).where(Run.id == instance.instance_id).values(status="pending"))
-        await session.commit()
 
     claimed = await _runs.claim_pending_runs(flow._store, limit=10)
 
-    assert instance.instance_id in {run_id for run_id, _, _ in claimed}
+    assert instance.instance_id in {c.run_id for c in claimed}
 
 
 @pytest.mark.asyncio
@@ -168,7 +169,7 @@ async def test_a_due_step_beats_a_waiting_one_in_the_same_run(flow: Flow):
     instance = await _pending_run(flow, "t.backoff.mixed")
     await _schedule_retry(flow, instance.instance_id, seconds=60)
 
-    ready_id, _, _ = await _steps.upsert_pending_step(
+    slot = await _steps.upsert_pending_step(
         flow._store,
         run_id=instance.instance_id,
         step_name="other",
@@ -177,8 +178,11 @@ async def test_a_due_step_beats_a_waiting_one_in_the_same_run(flow: Flow):
         args_hash="h2",
         max_attempts=3,
     )
+
+    ready_id = slot.step_id
+    await _steps.mark_step_running(flow._store, ready_id)
     await _steps.mark_step_failed(flow._store, ready_id, "boom", final=False, retry_in_seconds=0)
 
     claimed = await _runs.claim_pending_runs(flow._store, limit=10)
 
-    assert instance.instance_id in {run_id for run_id, _, _ in claimed}
+    assert instance.instance_id in {c.run_id for c in claimed}

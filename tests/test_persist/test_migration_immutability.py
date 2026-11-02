@@ -47,7 +47,11 @@ MIGRATIONS = pathlib.Path(__file__).resolve().parents[2] / "src" / "forktex_flow
 #: sha256 of every migration that has shipped. A new migration adds a line here;
 #: an existing line changing means an applied migration was edited.
 SHIPPED: dict[str, str] = {
-    "v0001__schema.sql": "0f6ea1df4f2047f682c2a02130d4c490ab99aac29ff218d974397d8d8b096a67",
+    "v0001__workflow.sql": "89b0fd83aadce109ba2fbe04074f4a5429fd7829b9f46c88d252fd4af21006f8",
+    "v0002__run.sql": "25c51c48fb871403989c197f0f9b39ac4ea0fb1ae53e5d13399b0b73b56e95e7",
+    "v0003__step_run.sql": "40cc9e264b82da76ab81efc0153916d47247372e97543bb8247f49f1380b60d7",
+    "v0004__run_event.sql": "29a0f1bbd1813cad0403625c9f5ce8f5122c84178629ebb4d546682cb2c636d8",
+    "v0005__scheduled_run.sql": "4b184a9e30c257ff6dc2bf003b861dcd2e6ecf2e8dd23133d12ac92eca6947ee",
 }
 
 

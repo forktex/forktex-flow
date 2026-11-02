@@ -21,31 +21,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""``Flow`` — the public facade. Construct one per process.
-
-Declare workflows with the two decorators, dispatch with :meth:`run`, find runs
-with :meth:`query`::
-
-    flow = Flow(database_url="postgresql+asyncpg://…")
-
-    @flow.scheduled("cloud.backup.create", version=1, cron="0 2 * * *", state=BackupState)
-    async def backup_create(ctx: Ctx, state: BackupState) -> dict: ...
-
-    @flow.pipeline("cloud.deploy.apply", version=4, state=DeployState)
-    class DeployApply:
-        steps = [load_manifest, provision, step(dns_setup, when=lambda s: s["dns"])]
-
-    await flow.init()            # bring the schema up
-    await flow.start_driver()    # compete for leadership and execute
-
-    instance = await flow.run("cloud.deploy.apply", state={...}, metadata={...})
-    page = await flow.query().workflow("cloud.deploy.apply").status("running").fetch()
-
-This class assembles a :class:`FlowStore`, a :class:`FlowRegistry` and a
-:class:`RuntimeConfig` and hands them down. It is imported by ``__init__`` and
-by nothing else in the package — every layer below takes what it needs rather
-than taking this.
-"""
 
 from __future__ import annotations
 
@@ -57,8 +32,10 @@ from typing import TYPE_CHECKING, Any
 from forktex.database import Database, advisory_key
 from forktex.error import BadRequestError, NotFoundError
 from forktex.log import get_logger
+from forktex.types import JsonObject
 
 from forktex_flow.domain.config import RuntimeConfig
+from forktex_flow.errors import FlowClosed
 from forktex_flow.persist import runs as _runs
 from forktex_flow.persist.migrations import apply_migrations
 from forktex_flow.persist.store import FlowStore
@@ -85,30 +62,13 @@ logger = get_logger(__name__)
 #: forking the model definitions.
 _MODEL_SCHEMA = "forktex_flow"
 
-#: Default advisory-lock key for leader election. Derived through
-#: `advisory_key`, the one place that folds a digest into Postgres's signed
-#: bigint range — a second derivation of the same thing is what let three
-#: incompatible lock keys into the ecosystem before.
-_DEFAULT_LEADER_LOCK_KEY = advisory_key(_MODEL_SCHEMA, "driver")
+#: ``leader_lock_key`` left at this value means "derive it from the schema".
+#: `advisory_key` never returns 0, so a derived key cannot collide with it.
+_DERIVE_LEADER_LOCK_KEY = 0
 
 
 class Flow:
-    """Durable workflow runtime.
-
-    Args:
-        database_url: SQLAlchemy async URL. Builds a pool dedicated to this
-            Flow. Mutually exclusive with ``database``.
-        database: An existing :class:`forktex.database.Database` to share a pool
-            with the rest of the application. Its ``schema_translate_map`` must
-            remap ``forktex_flow`` to ``schema``.
-        schema: The Postgres schema to create and use. Defaults to
-            ``forktex_flow``.
-        extensions: Consumer hooks — metadata injection and terminal
-            notifications. See :class:`FlowExtension`.
-        config: Retry and polling behaviour. See :class:`RuntimeConfig`.
-        echo: Echo SQL. Only meaningful with ``database_url``.
-        engine_kwargs: Passed verbatim to ``create_async_engine``.
-    """
+    """Durable workflow runtime. Its ``schema_translate_map`` must remap ``forktex_flow`` to ``schema``."""
 
     def __init__(
         self,
@@ -136,9 +96,8 @@ class Flow:
             self._db = database
             self._owns_db = False
         else:
-            # Connection management belongs to `Database`, not here — this used
-            # to duplicate `init_engine` almost line for line. Construction is
-            # lazy either way: nothing connects until something executes.
+            # `Database` owns connection management. Construction is lazy:
+            # nothing connects until something executes.
             self._db = Database(
                 database_url,  # type: ignore[arg-type]  # guarded above
                 echo=echo,
@@ -148,9 +107,11 @@ class Flow:
             self._owns_db = True
 
         self.extensions: tuple[FlowExtension, ...] = tuple(extensions or ())
+        self._closed = False
+        self._driver_lock = asyncio.Lock()
         self._store = FlowStore(database=self._db, schema=schema)
         self._registry = FlowRegistry()
-        self._config = config or RuntimeConfig(leader_lock_key=_DEFAULT_LEADER_LOCK_KEY)
+        self._config = _with_lock_key(config or RuntimeConfig(), schema)
         self._runtime = FlowRuntime(
             store=self._store,
             registry=self._registry,
@@ -164,41 +125,41 @@ class Flow:
 
     @property
     def schema(self) -> str:
-        """The Postgres schema this Flow reads and writes."""
         return self._store.schema
 
     @property
     def engine(self) -> AsyncEngine:
-        """The engine backing this Flow — for DDL, advisory locks, migrations."""
         return self._store.engine
 
     def session(self) -> AbstractAsyncContextManager[AsyncSession]:
-        """A transactional session on this Flow's pool.
-
-        Public because a consumer sometimes needs to read the engine's own
-        tables — tailing ``run_event`` for a live progress stream, say — inside
-        the same pool rather than opening a second one.
+        """A read session on this Flow's pool. The engine owns this transaction: ``commit()`` raises
+        ``TransactionBoundaryError``.
         """
         return self._store.session()
 
     async def init(self) -> None:
-        """Bring the schema up to date. Idempotent, and safe to call from every
-        worker: concurrent callers serialise on an advisory lock."""
+        """Bring the schema up to date. Idempotent, and safe to call from every worker: concurrent callers
+        serialise on an advisory lock.
+        """
+        self._refuse_if_closed()
         await apply_migrations(self.engine, self.schema)
 
-    async def start_driver(self) -> None:
-        """Start competing for leadership and executing runs. Returns at once.
+    async def verify(self) -> None:
+        """Probe the pool, creating nothing. Raises ``DatabaseUnreachableError``."""
+        self._refuse_if_closed()
+        await self._db.verify()
 
-        Safe on every worker — only the lock holder actually drives.
-        """
-        if self._driver_task is not None and not self._driver_task.done():
-            return
-        await self.init()
-        self._driver = Driver(self._runtime)
-        self._driver_task = asyncio.create_task(
-            self._driver.run(),
-            name=f"forktex_flow.driver[{self.schema}]",
-        )
+    async def start_driver(self) -> None:
+        self._refuse_if_closed()
+        async with self._driver_lock:
+            if self._driver_task is not None and not self._driver_task.done():
+                return
+            await self.init()
+            self._driver = Driver(self._runtime)
+            self._driver_task = asyncio.create_task(
+                self._driver.run(),
+                name=f"forktex_flow.driver[{self.schema}]",
+            )
 
     async def stop_driver(self) -> None:
         """Stop the driver loop cleanly. Idempotent."""
@@ -218,15 +179,18 @@ class Flow:
             self._driver = None
 
     async def close(self) -> None:
-        """Stop the driver and release resources. Call from your shutdown handler.
-
-        Disposes the pool only if this Flow created it: a pool passed in via
-        ``database=`` belongs to the caller, and disposing it here would tear
-        down the rest of the application's database access.
-        """
         await self.stop_driver()
+        self._closed = True
         if self._owns_db:
             await self._db.dispose()
+
+    def _refuse_if_closed(self) -> None:
+        """Guard the entry points that touch the pool. Disposing the pool does not invalidate the handle, so a call
+        after ``close()`` either raises from deep inside the driver or quietly opens a fresh connection — which
+        leaks a pool nothing will dispose.
+        """
+        if self._closed:
+            raise FlowClosed("this Flow is closed; construct a new one")
 
     # ── Declaration ──────────────────────────────────────────────────────
 
@@ -239,18 +203,6 @@ class Flow:
         state: type | None = None,
         enabled: bool = True,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register one async function to run on a cron schedule.
-
-        ``enabled=False`` writes the schedule's row without arming it, for a
-        cron whose first tick does something you want to authorise by hand — a
-        reaper that destroys expired infrastructure, say. The workflow is
-        registered and dispatchable through :meth:`run`; only the timer is off.
-
-        The flag is read when the row is **first** written. From then on the
-        database is authoritative and re-registration leaves it alone, so
-        ``UPDATE scheduled_run SET enabled = true`` is how it is turned on and a
-        later deploy will not silently re-arm or disarm it.
-        """
 
         def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             self._registry.register(
@@ -276,11 +228,6 @@ class Flow:
         state: type | None = None,
         cron: str | None = None,
     ) -> Callable[[type], type]:
-        """Register a class with a ``steps`` list as an ordered workflow.
-
-        ``cron`` makes it scheduled as well as callable — the two decorators
-        differ only in whether the definition carries a schedule.
-        """
 
         def _decorator(cls: type) -> type:
             self._registry.register(
@@ -291,7 +238,6 @@ class Flow:
         return _decorator
 
     def registered(self) -> list[str]:
-        """Every workflow name declared in this process."""
         return self._registry.names()
 
     # ── Dispatch and read ────────────────────────────────────────────────
@@ -300,22 +246,11 @@ class Flow:
         self,
         name: str,
         *,
-        state: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
+        state: JsonObject | None = None,
+        metadata: JsonObject | None = None,
         version: int | None = None,
     ) -> WorkflowInstance:
-        """Submit a run and return immediately with a handle on it.
-
-        The run is inserted ``pending``; the driver picks it up on its next
-        tick. Await :meth:`WorkflowInstance.wait` for the outcome.
-
-        A run started this way is labelled ``triggered_by="manual"``, which is
-        what ``.triggered_by()`` filters on. The label is not a parameter: the
-        only other value is ``"schedule"``, the driver writes it, and
-        ``ck_run_triggered_by`` rejects anything else — so exposing it would let
-        a caller either mislabel a run or take an IntegrityError from four
-        frames down.
-        """
+        self._refuse_if_closed()
         defn = self._registry.get(name, version=version)
         if defn is None:
             raise NotFoundError(f"workflow {name!r} is not registered in this process")
@@ -341,25 +276,25 @@ class Flow:
         return await self.get(run_id)
 
     async def get(self, run_id: UUID) -> WorkflowInstance:
-        """The run with this id.
-
-        Raises ``NotFoundError`` when it does not exist.
-        """
+        """The run with this id. Raises ``NotFoundError`` when it does not exist."""
+        self._refuse_if_closed()
         info = await _runs.fetch_run(self._store, run_id)
         if info is None:
             raise NotFoundError(f"run {run_id} not found")
         return bind_instance(info, self._store)
 
     def query(self) -> InstanceQuery:
-        """Start a fluent query over runs."""
         return InstanceQuery(self._store)
 
     def _execution_context(self) -> FlowRuntime:
-        """What the driver hands the executor.
-
-        Private, but named: :mod:`forktex_flow.testing` needs it to run a
-        workflow inline instead of through a driver, and reaching into four
-        attributes from another module is worse than one accessor that says
-        what it is for.
-        """
         return self._runtime
+
+
+def _with_lock_key(config: RuntimeConfig, schema: str) -> RuntimeConfig:
+    """Give the driver a lock key derived from *this* instance's schema. Leader election is one advisory lock, so
+    two ``Flow``s sharing a key share a leader: whichever wins drives and the other idles, with its schedules
+    never firing.
+    """
+    if config.leader_lock_key != _DERIVE_LEADER_LOCK_KEY:
+        return config
+    return config.model_copy(update={"leader_lock_key": advisory_key(schema, "driver")})

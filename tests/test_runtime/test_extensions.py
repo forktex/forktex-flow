@@ -28,8 +28,10 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 import pytest
+import sqlalchemy as sa
 
 from forktex_flow import Ctx, Flow, RunInfo, step
+from forktex_flow.persist import runs as _runs
 from forktex_flow.runtime.context import FlowRuntime
 from forktex_flow.runtime.execution import execute_run
 
@@ -211,4 +213,50 @@ async def test_after_fail_fires_and_receives_the_error(postgres_url_str: str):
     finally:
         async with flow.engine.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await flow.close()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_run_does_not_report_itself_completed(postgres_url_str: str) -> None:
+    """`update_run_status` declines a write to a terminal run and returns False.
+    The return was discarded, so a cancelled run still emitted `run_completed`
+    and fired `after_complete` — with the pre-execution snapshot, so the hook
+    saw `status='pending'` and a consumer sent "deploy succeeded"."""
+    import uuid
+
+    seen: list[tuple[str, str]] = []
+
+    class Recorder:
+        async def after_complete(self, run: RunInfo, output: Any) -> None:
+            seen.append(("after_complete", run.status))
+
+        async def after_fail(self, run: RunInfo, error: BaseException) -> None:
+            seen.append(("after_fail", run.status))
+
+    schema = "forktex_flow_" + uuid.uuid7().hex
+    flow = Flow(postgres_url_str, schema=schema, extensions=[Recorder()])
+    try:
+        await flow.init()
+
+        async def work(ctx: Ctx, state: dict) -> dict:
+            await _runs.update_run_status(flow._store, ctx.run_id, status="cancelled", error="cancelled by operator")
+            return {"done": True}
+
+        flow.pipeline("cancel.report", version=1)(type("W", (), {"steps": [work]}))
+        instance = await flow.run("cancel.report", version=1)
+        runtime = FlowRuntime(flow._store, flow._registry, flow._config, flow.extensions)
+        await execute_run(runtime, instance.instance_id, "cancel.report", 1)
+
+        final = await flow.get(instance.instance_id)
+        async with flow.session() as session:
+            rows = await session.execute(
+                sa.text(f'SELECT event_type FROM "{flow.schema}".run_event WHERE run_id = :r'),  # noqa: S608
+                {"r": instance.instance_id},
+            )
+            events = [r[0] for r in rows]
+
+        assert final.status == "cancelled"
+        assert "run_completed" not in events, f"a cancelled run announced completion: {events}"
+        assert [h for h, _ in seen] != ["after_complete"], f"after_complete fired on a cancelled run: {seen}"
+    finally:
         await flow.close()

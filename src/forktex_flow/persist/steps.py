@@ -21,12 +21,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Reads and writes on ``forktex_flow.step_run`` — the durable step-attempt table.
-
-A step row is the unit replay keys off: `upsert_pending_step` is the idempotence boundary
-(same run + qualname + args hash returns the cached outcome), and the `mark_step_*`
-transitions record what happened. Stale-attempt reclaim compares against the **database**
-clock, never the worker's, so a skewed worker cannot reclaim live work.
+"""Reads and writes on ``forktex_flow.step_run`` — the durable step-attempt table. Stale-attempt reclaim compares
+against the **database** clock, never the worker's, so a skewed worker cannot reclaim live work.
 """
 
 from __future__ import annotations
@@ -41,8 +37,10 @@ from forktex.types import JsonValue
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from forktex_flow.domain.types import StepSlot
 from forktex_flow.errors import StepClaimLost
 from forktex_flow.persist.models import StepRun
+from forktex_flow.persist.store import rowcount
 
 if TYPE_CHECKING:
     from forktex_flow.persist.store import FlowStore
@@ -56,7 +54,6 @@ logger = get_logger(__name__)
 _MAX_ERROR_CHARS = 5000
 
 __all__ = [
-    "SKIPPED_OUTPUT",
     "heartbeat_step",
     "mark_step_completed",
     "mark_step_failed",
@@ -71,18 +68,6 @@ __all__ = [
 #: the CHECK constraint allows five statuses and "skipped" is not one of them,
 #: and more importantly a skipped step *must* leave a completed row, or a resume
 #: re-evaluates its guard against a state that has since moved on.
-SKIPPED_OUTPUT: dict[str, bool] = {"__skipped__": True}
-
-
-def _rowcount(result: object) -> int:
-    """How many rows an UPDATE touched.
-
-    Every backend this library targets supports `rowcount` on an UPDATE, but
-    pyright's stub does not expose it on the base `Result` type — so the access
-    needs a typed fallback, and it needed one in two places with the same
-    comment beside each.
-    """
-    return getattr(result, "rowcount", 0) or 0
 
 
 async def upsert_pending_step(
@@ -94,22 +79,9 @@ async def upsert_pending_step(
     step_index: int,
     args_hash: str,
     max_attempts: int,
-) -> tuple[UUID, str, JsonValue]:
-    """Get or create the row for one step invocation, in a single statement.
-
-    Returns ``(step_id, status, output)``. A ``completed`` status is the cache
-    hit that lets a resumed run skip the body and reuse the recorded output.
-
-    ``ON CONFLICT DO UPDATE … RETURNING`` rather than select-then-insert. The
-    previous shape was a SELECT, an INSERT, and — when two workers raced — an
-    `IntegrityError`, a rollback and a second SELECT: three round trips and a
-    window between the read and the write that concurrency tests rarely
-    reproduce and production reliably hits. The conflict target is
-    ``uq_step_run_identity``, so the losing writer is handed the winner's row
-    instead of an exception to recover from.
-
-    The `DO UPDATE` is a deliberate no-op write of ``step_name`` to itself:
-    `ON CONFLICT DO NOTHING` returns no row at all on a conflict, which would
+) -> StepSlot:
+    """Get or create the row for one step invocation, in a single statement. The `DO UPDATE` is a deliberate no-op
+    write of ``step_name`` to itself: `ON CONFLICT DO NOTHING` returns no row at all on a conflict, which would
     put the second SELECT straight back.
     """
     statement = (
@@ -128,23 +100,19 @@ async def upsert_pending_step(
             constraint="uq_step_run_identity",
             set_={"step_name": StepRun.step_name},
         )
-        .returning(StepRun.id, StepRun.status, StepRun.output)
+        .returning(StepRun.id, StepRun.status, StepRun.output, StepRun.skipped)
     )
     async with store.session() as session:
         row = (await session.execute(statement)).one()
-        await session.commit()
-        return row.id, row.status, row.output
+        return StepSlot(step_id=row.id, status=row.status, output=row.output, skipped=row.skipped)
 
 
 async def mark_step_running(store: FlowStore, step_id: UUID) -> None:
-    """Claim a pending step by flipping it to ``running`` — a compare-and-swap,
-    not a blind write. ``WHERE status='pending'`` is the guard: without it, a
-    step reclaimed by :func:`reclaim_stale_steps` while its original executor
-    is still (merely slowly) running would let both executors believe they
-    hold it, and a non-idempotent step body would run twice concurrently.
-
-    Raises :class:`StepClaimLost` when the row was not ``pending`` — this
-    executor lost the race and must abort without touching run/step state.
+    """Claim a pending step by flipping it to ``running`` — a compare-and-swap, not a blind write. ``WHERE
+    status='pending'`` is the guard: without it, a step reclaimed by :func:`reclaim_stale_steps` while its
+    original executor is still (merely slowly) running would let both executors believe they hold it, and a non-
+    idempotent step body would run twice concurrently. Raises :class:`StepClaimLost` when the row was not
+    ``pending`` — this executor lost the race and must abort without touching run/step state.
     """
     async with store.session() as session:
         result = await session.execute(
@@ -157,29 +125,38 @@ async def mark_step_running(store: FlowStore, step_id: UUID) -> None:
                 heartbeat_at=sa.func.now(),
             )
         )
-        await session.commit()
-        if _rowcount(result) == 0:
+        if rowcount(result) == 0:
             raise StepClaimLost(f"step {step_id} is no longer pending; claim lost to a concurrent executor")
 
 
-async def heartbeat_step(store: FlowStore, step_id: UUID) -> None:
+async def heartbeat_step(store: FlowStore, step_id: UUID) -> bool:
+    """Stamp the step alive. ``False`` when the row is no longer ``running`` — the claim is gone and the caller
+    must stop stamping it.
+    """
     async with store.session() as session:
-        await session.execute(update(StepRun).where(StepRun.id == step_id).values(heartbeat_at=sa.func.now()))
-        await session.commit()
+        result = await session.execute(
+            update(StepRun).where(StepRun.id == step_id, StepRun.status == "running").values(heartbeat_at=sa.func.now())
+        )
+        return rowcount(result) > 0
 
 
 async def mark_step_completed(store: FlowStore, step_id: UUID, output: JsonValue) -> None:
+    """Record a step's result. Raises :class:`StepClaimLost` when the row is no longer ``running`` — the same
+    ownership guard :func:`mark_step_failed` and :func:`mark_step_skipped` carry, so a worker whose claim lapsed
+    cannot write an outcome over the one that took it.
+    """
     async with store.session() as session:
-        await session.execute(
+        result = await session.execute(
             update(StepRun)
-            .where(StepRun.id == step_id)
+            .where(StepRun.id == step_id, StepRun.status == "running")
             .values(
                 status="completed",
                 output=output,
                 finished_at=sa.func.now(),
             )
         )
-        await session.commit()
+        if rowcount(result) == 0:
+            raise StepClaimLost(f"step {step_id} is no longer running; its claim was lost")
 
 
 async def mark_step_failed(
@@ -192,15 +169,9 @@ async def mark_step_failed(
 ) -> datetime | None:
     """Mark a step failed; when not ``final``, schedule its retry.
 
-    ``retry_in_seconds`` is resolved against the **database** clock
-    (``now() + interval``) rather than the app's, because the driver selects
-    due retries with ``next_attempt_at <= sa.func.now()`` — also the DB clock.
-    Computing the deadline app-side put two clocks on either side of that
-    comparison, so retries fired early or late by whatever the app↔Postgres
-    skew happened to be.
-
-    Returns the stored ``next_attempt_at`` (as the database computed it) so
-    callers can report the real value instead of an app-side estimate.
+    Raises :class:`StepClaimLost` when the row is no longer ``running``.
+    ``retry_in_seconds`` resolves against the database clock, which is also
+    what the driver's due-check reads.
     """
     new_status = "failed" if final else "pending"
     values: dict[str, Any] = {
@@ -212,44 +183,42 @@ async def mark_step_failed(
         values["finished_at"] = sa.func.now()
     async with store.session() as session:
         result = await session.execute(
-            update(StepRun).where(StepRun.id == step_id).values(**values).returning(StepRun.next_attempt_at)
+            update(StepRun)
+            .where(StepRun.id == step_id, StepRun.status == "running")
+            .values(**values)
+            .returning(StepRun.id, StepRun.next_attempt_at)
         )
-        stored = result.scalar_one_or_none()
-        await session.commit()
-        return stored
+        # The returned row is the ownership signal: `next_attempt_at` is
+        # legitimately NULL for a final failure, so None cannot stand in for it.
+        row = result.first()
+        if row is None:
+            raise StepClaimLost(f"step {step_id} is no longer running; its claim was lost")
+        return row.next_attempt_at
 
 
 async def mark_step_skipped(store: FlowStore, step_id: UUID) -> None:
     """Record that a step's ``when_fn`` guard declined it.
 
-    Written as ``completed`` with :data:`SKIPPED_OUTPUT`, so a resume treats it
-    as already-decided rather than re-evaluating the guard.
+    Written as ``completed`` with ``skipped`` set, so a resume does not
+    re-evaluate the guard against a state that has since moved on. Raises
+    :class:`StepClaimLost` when the row is no longer ``running``.
     """
     async with store.session() as session:
-        await session.execute(
+        result = await session.execute(
             update(StepRun)
-            .where(StepRun.id == step_id)
+            .where(StepRun.id == step_id, StepRun.status == "running")
             .values(
                 status="completed",
-                output=SKIPPED_OUTPUT,
+                output={},
+                skipped=True,
                 finished_at=sa.func.now(),
             )
         )
-        await session.commit()
+        if rowcount(result) == 0:
+            raise StepClaimLost(f"step {step_id} is no longer running; its claim was lost")
 
 
 async def reclaim_stale_steps(store: FlowStore, stale_threshold: float) -> int:
-    """Reset any ``running`` step_run rows whose heartbeat is older
-    than ``stale_threshold`` to ``pending``.
-
-    The cutoff is computed on the **database** clock, not the app's.
-    ``heartbeat_at`` is written with ``sa.func.now()`` (see
-    :func:`mark_step_running` / :func:`heartbeat_step`), so comparing it
-    against a Python-side ``iso.now()`` cutoff put two different clocks on
-    either side of the comparison: with the app clock even slightly ahead of
-    Postgres, a *live* step could be reclaimed to ``pending`` and executed a
-    second time concurrently.
-    """
     cutoff = sa.func.now() - timedelta(seconds=stale_threshold)
     note = sa.literal("\n[reclaimed: heartbeat stale]")
     async with store.session() as session:
@@ -262,23 +231,16 @@ async def reclaim_stale_steps(store: FlowStore, stale_threshold: float) -> int:
             .values(
                 status="pending",
                 # Left-truncated to the same cap every other write of `error`
-                # uses: a step that is reclaimed repeatedly would otherwise
+                # uses: without it a step reclaimed repeatedly would
                 # append this note forever, and the column is TEXT so nothing
                 # would ever complain.
                 error=sa.func.left(sa.func.coalesce(StepRun.error, "") + note, _MAX_ERROR_CHARS),
             )
         )
-        await session.commit()
-        return _rowcount(result)
+        return rowcount(result)
 
 
 async def read_step_attempts(store: FlowStore, step_id: UUID) -> int:
-    """The step's current ``attempts`` count.
-
-    Read back from the row rather than tracked in memory: the increment happens
-    in the database, and a reclaimed step carries attempts from an executor that
-    is no longer running.
-    """
     async with store.session() as session:
         attempts = (await session.execute(select(StepRun.attempts).where(StepRun.id == step_id))).scalar_one()
         return attempts or 0
