@@ -21,19 +21,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Verify the repo is coherent about which version it is about to publish.
+"""Version, CHANGELOG, dist/ and (optionally) the git tag agree before a publish.
 
-    python scripts/release_check.py            # version vs CHANGELOG
-    python scripts/release_check.py v0.1.0     # ...and vs the git tag
-
-Three ways a publish goes out wrong that nothing else here catches: the tag
-disagrees with `pyproject.toml`, the version being shipped has no CHANGELOG
-section, or real changes are still filed under `[Unreleased]` and therefore
-absent from the notes for the release that contains them. A PyPI version is
-immutable, so each of these is unfixable after the upload.
-
-This lives in a script rather than inline in the publish workflow so it can be
-run before pushing a tag (`gate:ci-is-one-command`).
+    python scripts/release_check.py            # version vs CHANGELOG and dist/
+    python scripts/release_check.py v1.0.0     # ...and vs the git tag
 """
 
 from __future__ import annotations
@@ -66,13 +57,7 @@ def _changelog_sections(text: str) -> dict[str, str]:
 
 
 def _dist_problems(version: str) -> list[str]:
-    """Confirm dist/ holds exactly this version's artefacts, and nothing else.
-
-    `make publish` uploads `dist/*` verbatim. `make build` clears the directory
-    first, so the two agree — until someone bumps the version and publishes
-    without rebuilding, which uploads the previous version's wheel under a
-    release everyone believes is the new one. PyPI will not let it be replaced.
-    """
+    """dist/ holds exactly this version's artefacts, and nothing else."""
     dist = ROOT / "dist"
     if not dist.is_dir():
         return ["dist/ does not exist — run `make build`"]
@@ -81,7 +66,6 @@ def _dist_problems(version: str) -> list[str]:
     if not artefacts:
         return ["dist/ is empty — run `make build`"]
 
-    # Wheels normalise `-` to `_`; sdists follow the same rule for the name.
     stem = f"{version}"
     stale = [name for name in artefacts if f"-{stem}-" not in name and f"-{stem}." not in name]
     if stale:

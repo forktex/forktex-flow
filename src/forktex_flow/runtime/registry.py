@@ -28,29 +28,57 @@ from forktex.error import AlreadyExistsError
 from forktex.types import BaseValueObject
 from pydantic import Field
 
-from forktex_flow.domain.definition import WorkflowDefinition
+from forktex_flow.domain.node import HandlerFn, WhenFn
+from forktex_flow.domain.process import ProcessModel
+from forktex_flow.domain.state import ReducerFn
 
-__all__ = ["FlowRegistry"]
+__all__ = ["CodeDefinition", "FlowRegistry", "Handler"]
+
+
+class Handler(BaseValueObject):
+    task_type: str
+    fn: HandlerFn
+    when: WhenFn | None = None
+
+
+class CodeDefinition(BaseValueObject):
+    model: ProcessModel
+    reducers: dict[str, ReducerFn] = Field(default_factory=dict)
+    cron: str | None = None
+    enabled: bool = True
 
 
 class FlowRegistry(BaseValueObject):
-    definitions: dict[tuple[str, int], WorkflowDefinition] = Field(default_factory=dict)
+    handlers: dict[str, Handler] = Field(default_factory=dict)
+    definitions: dict[str, CodeDefinition] = Field(default_factory=dict)
 
-    def register(self, defn: WorkflowDefinition) -> None:
-        """Add a definition. Raises if that exact ``(name, version)`` is taken."""
-        key = (defn.name, defn.version)
+    def handle(self, handler: Handler) -> None:
+        """Raises ``AlreadyExistsError`` for a task type this Flow already handles."""
+        if handler.task_type in self.handlers:
+            raise AlreadyExistsError(f"task type {handler.task_type!r} already has a handler")
+        self.handlers[handler.task_type] = handler
+
+    def declare(self, definition: CodeDefinition, handlers: list[Handler]) -> None:
+        """Raises ``AlreadyExistsError`` for a key or task type already declared, registering nothing."""
+        key = definition.model.key
         if key in self.definitions:
-            raise AlreadyExistsError(f"workflow {defn.name!r} version {defn.version} is already registered")
-        self.definitions[key] = defn
+            raise AlreadyExistsError(f"workflow {key!r} is already declared")
+        taken = [handler.task_type for handler in handlers if handler.task_type in self.handlers]
+        if taken:
+            raise AlreadyExistsError(f"task types {taken} already have handlers")
+        self.definitions[key] = definition
+        for handler in handlers:
+            self.handlers[handler.task_type] = handler
 
-    def get(self, name: str, *, version: int | None = None) -> WorkflowDefinition | None:
-        if version is not None:
-            return self.definitions.get((name, version))
-        matching = [defn for (candidate, _), defn in self.definitions.items() if candidate == name]
-        return max(matching, key=lambda d: d.version) if matching else None
+    def handler(self, task_type: str) -> Handler | None:
+        return self.handlers.get(task_type)
 
-    def scheduled(self) -> list[WorkflowDefinition]:
-        return [defn for defn in self.definitions.values() if defn.schedule is not None]
+    def task_types(self) -> list[str]:
+        return sorted(self.handlers)
 
-    def names(self) -> list[str]:
-        return sorted({name for name, _ in self.definitions})
+    def reducers(self, key: str) -> dict[str, ReducerFn]:
+        definition = self.definitions.get(key)
+        return {} if definition is None else definition.reducers
+
+    def keys(self) -> list[str]:
+        return sorted(self.definitions)

@@ -21,26 +21,17 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Flow's read layer: the fluent finder and the SQL it compiles to. Split along what a consumer holds: a
-vocabulary, versus machinery it never sees.
-"""
+"""Flow's read layer: the instance handle, the fluent finder, and the SQL it compiles to."""
 
-from forktex_flow.read.instance import (
-    InstancePage,
-    InstanceQuery,
-    NodeInstance,
-    WorkflowInstance,
-    bind_instance,
-)
-from forktex_flow.read.query import count_runs, fetch_page, summarise_runs
+from forktex_flow.read.instance import InstancePage, InstanceQuery, WorkflowInstance, bind_instance
+from forktex_flow.read.query import count_instances, fetch_page, summarise_instances
 
 __all__ = [
     "InstancePage",
     "InstanceQuery",
-    "NodeInstance",
     "WorkflowInstance",
     "bind_instance",
-    "count_runs",
+    "count_instances",
     "fetch_page",
-    "summarise_runs",
+    "summarise_instances",
 ]

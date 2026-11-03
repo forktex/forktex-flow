@@ -24,120 +24,87 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
 from typing import Any
 
+from croniter import croniter
 from forktex.error import BadRequestError
 
-from forktex_flow.domain.config import RuntimeConfig
-from forktex_flow.domain.definition import NodeDef, NodeFn, WhenFn, WorkflowDefinition
-from forktex_flow.domain.node import StepMeta, StepSpec, step_meta
-from forktex_flow.domain.state import ReducerFn, extract_reducers
+from forktex_flow.domain.node import HandlerFn, StepMeta, StepSpec, WhenFn, step_meta
+from forktex_flow.domain.process import EndEvent, ProcessModel, SequenceFlow, ServiceTask, StartEvent
+from forktex_flow.domain.state import extract_reducers
+from forktex_flow.runtime.registry import CodeDefinition, Handler
 
 __all__ = ["compile_pipeline", "compile_scheduled"]
 
+_START, _END = "start", "end"
+
 
 def compile_scheduled(
-    fn: NodeFn,
-    *,
-    name: str,
-    version: int,
-    cron: str,
-    state_cls: type | None = None,
-    enabled: bool = True,
-    defaults: RuntimeConfig | None = None,
-) -> WorkflowDefinition:
-    resolved = defaults or RuntimeConfig()
-    max_attempts, backoff = _retry(step_meta(fn), resolved)
-    return WorkflowDefinition(
-        name=name,
-        version=version,
-        state_cls=state_cls,
-        nodes=(
-            NodeDef(
-                name=getattr(fn, "__name__", "run"),
-                fn=fn,
-                max_attempts=max_attempts,
-                backoff=backoff,
-            ),
-        ),
-        reducers=extract_reducers(state_cls),
-        schedule=cron,
+    fn: HandlerFn, *, key: str, cron: str, state_cls: type | None = None, enabled: bool = True
+) -> tuple[CodeDefinition, list[Handler]]:
+    return _linear(key, [fn], cron=cron, state_cls=state_cls, enabled=enabled)
+
+
+def compile_pipeline(
+    cls: type, *, key: str, cron: str | None = None, state_cls: type | None = None, enabled: bool = True
+) -> tuple[CodeDefinition, list[Handler]]:
+    steps: list[Any] = list(getattr(cls, "steps", []))
+    if not steps:
+        raise BadRequestError(f"pipeline {key!r}: class {cls.__name__} declares no steps")
+    return _linear(
+        key,
+        steps,
+        cron=cron,
+        state_cls=state_cls if state_cls is not None else getattr(cls, "state_cls", None),
         enabled=enabled,
     )
 
 
-def compile_pipeline(
-    cls: type,
-    *,
-    name: str,
-    version: int,
-    cron: str | None = None,
-    state_cls: type | None = None,
-    defaults: RuntimeConfig | None = None,
-) -> WorkflowDefinition:
-    steps: list[Any] = list(getattr(cls, "steps", []))
-    if not steps:
-        raise BadRequestError(f"pipeline {name!r} v{version}: class {cls.__name__} declares no steps")
+def _linear(
+    key: str, steps: list[Any], *, cron: str | None, state_cls: type | None, enabled: bool
+) -> tuple[CodeDefinition, list[Handler]]:
+    if cron is not None and not croniter.is_valid(cron):
+        raise BadRequestError(f"workflow {key!r}: {cron!r} is not a valid cron expression")
 
-    resolved = defaults or RuntimeConfig()
-    nodes: list[NodeDef] = []
-    used: dict[str, int] = {}
+    tasks: list[ServiceTask] = []
+    handlers: list[Handler] = []
+    used = {_START, _END}
     for index, item in enumerate(steps):
-        fn, meta, when_fn = _resolve_step(item, resolved)
-        max_attempts, backoff = _retry(meta, resolved)
-
-        # The step name identifies its row in `step_run`, so the same function
-        # used twice in one pipeline needs two names. Suffix by position rather
-        # than by an occurrence counter: the position is stable when the list is
-        # edited elsewhere, so a resumed run still matches its recorded rows.
-        node_name = getattr(fn, "__name__", f"step_{index}")
-        if node_name in used:
-            node_name = f"{node_name}_{index}"
-        used[node_name] = index
-
-        nodes.append(
-            NodeDef(
-                name=node_name,
-                fn=fn,
-                max_attempts=max_attempts,
-                backoff=backoff,
-                when_fn=when_fn,
+        fn, meta, when = _resolve(item)
+        # Suffixed by position, which stays stable when the list is edited elsewhere.
+        name = getattr(fn, "__name__", f"step_{index}")
+        if name in used:
+            name = f"{name}_{index}"
+        used.add(name)
+        task_type = f"{key}:{name}"
+        tasks.append(
+            ServiceTask(
+                id=name,
+                task_type=task_type,
+                retries=meta.max_attempts,
+                backoff=meta.backoff,
             )
         )
+        handlers.append(Handler(task_type=task_type, fn=fn, when=when))
 
-    effective_state_cls = state_cls if state_cls is not None else getattr(cls, "state_cls", None)
-    reducers: dict[str, ReducerFn] = extract_reducers(effective_state_cls)
-
-    return WorkflowDefinition(
-        name=name,
-        version=version,
-        state_cls=effective_state_cls,
-        nodes=tuple(nodes),
-        reducers=reducers,
-        schedule=cron,
+    ids = [_START, *(task.id for task in tasks), _END]
+    model = ProcessModel(
+        key=key,
+        elements=(StartEvent(id=_START), *tasks, EndEvent(id=_END)),
+        flows=tuple(
+            SequenceFlow(id=f"{source}->{target}", source=source, target=target) for source, target in pairwise(ids)
+        ),
     )
+    return CodeDefinition(model=model, reducers=extract_reducers(state_cls), cron=cron, enabled=enabled), handlers
 
 
-def _resolve_step(item: NodeFn | StepSpec, defaults: RuntimeConfig) -> tuple[NodeFn, StepMeta | None, WhenFn | None]:
+def _resolve(item: HandlerFn | StepSpec) -> tuple[HandlerFn, StepMeta, WhenFn | None]:
     if not isinstance(item, StepSpec):
-        return item, step_meta(item), None
-
-    meta = step_meta(item.fn)
-    if item.max_attempts is not None or item.backoff is not None:
-        # Values given to `step(...)` at the call site beat the decorator's:
-        # the pipeline is the more specific context.
-        meta = StepMeta(
-            max_attempts=(
-                item.max_attempts
-                if item.max_attempts is not None
-                else (meta.max_attempts if meta else defaults.max_attempts)
-            ),
-            backoff=item.backoff if item.backoff is not None else (meta.backoff if meta else defaults.backoff),
-        )
+        return item, step_meta(item) or StepMeta(), None
+    decorated = step_meta(item.fn) or StepMeta()
+    meta = StepMeta(
+        max_attempts=item.max_attempts if item.max_attempts is not None else decorated.max_attempts,
+        backoff=item.backoff if item.backoff is not None else decorated.backoff,
+    )
     return item.fn, meta, item.when
-
-
-def _retry(meta: StepMeta | None, defaults: RuntimeConfig) -> tuple[int, tuple[float, ...]]:
-    if meta is None:
-        return defaults.max_attempts, defaults.backoff
-    return meta.max_attempts, meta.backoff

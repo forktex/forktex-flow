@@ -27,32 +27,25 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    # Typing-only, so `extension` stays importable without pulling the engine's
-    # module graph in behind it.
-    from forktex.types import JsonObject, JsonValue
+    from forktex.types import JsonObject
 
-    from forktex_flow.domain.types import RunInfo
+    from forktex_flow.domain.types import InstanceInfo
+    from forktex_flow.errors import WorkflowFailed
 
 __all__ = ["FlowExtension"]
 
 
 @runtime_checkable
 class FlowExtension(Protocol):
-    """Hooks the library calls at well-defined points in a run's life. A hook that raises is logged and swallowed —
-    an extension observes a run, it does not get to change its outcome.
+    """Hooks called at fixed points of an instance's life. A terminal hook that raises is logged and swallowed: an
+    extension observes an instance, it does not change its outcome.
     """
 
-    async def before_start(
-        self,
-        name: str,
-        version: int,
-        input: JsonObject,
-        metadata: JsonObject,
-    ) -> JsonObject:
+    async def before_start(self, key: str, version: int, variables: JsonObject, metadata: JsonObject) -> JsonObject:
         return {}
 
-    async def after_complete(self, run: RunInfo, output: JsonValue) -> None:
-        """Called once a run has reached ``completed``."""
+    async def after_complete(self, instance: InstanceInfo, variables: JsonObject) -> None:
+        """Called once an instance has reached ``completed``."""
 
-    async def after_fail(self, run: RunInfo, error: BaseException) -> None:
-        """Called once a run has reached ``failed`` or ``cancelled``."""
+    async def after_fail(self, instance: InstanceInfo, error: WorkflowFailed) -> None:
+        """Called once an instance has reached ``failed``."""

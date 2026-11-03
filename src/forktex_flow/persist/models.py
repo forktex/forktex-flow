@@ -21,16 +21,12 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""SQLAlchemy ORM mappings for the ``forktex_flow.*`` tables. The two MUST stay in sync — the migration is what a
-deployed database actually has. The separate registry is load-bearing: ``BaseDBModel.metadata`` belongs to the
-consumer, whose ``create_all`` must not try to build this library's tables in schemas it never asked for.
-"""
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, get_args
+from typing import get_args
 
 import sqlalchemy as sa
 from forktex.database import substrate_base
@@ -38,167 +34,158 @@ from forktex.types import JsonObject
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from forktex_flow.domain.types import RunStatus
+from forktex_flow.domain.types import ElementStatus, InstanceStatus, TriggeredBy
 
 _SCHEMA = "forktex_flow"
-
-#: The statuses a run or a step may hold, taken from the type the rest of the
-#: package is written against, and rendered into a CHECK constraint on both
-#: tables — so the database, not a caller, is what guarantees the column never
-#: holds a value the executor cannot interpret.
-_STATUSES: tuple[str, ...] = get_args(RunStatus)
-_STATUS_CHECK = "status IN (" + ", ".join(f"'{s}'" for s in _STATUSES) + ")"
-
-#: Flow's own declarative registry — every table defaults to ``_SCHEMA``.
 _FlowBase = substrate_base(_SCHEMA)
 
 
-class Workflow(_FlowBase):
-    __tablename__ = "workflow"
+_IN = "{} IN ({})"
+_INSTANCE_STATUS_CHECK = _IN.format("status", ", ".join(f"'{v}'" for v in get_args(InstanceStatus)))
+_ELEMENT_STATUS_CHECK = _IN.format("status", ", ".join(f"'{v}'" for v in get_args(ElementStatus)))
+_TRIGGERED_BY_CHECK = _IN.format("triggered_by", ", ".join(f"'{v}'" for v in get_args(TriggeredBy)))
 
-    name: Mapped[str] = mapped_column(sa.String(255), primary_key=True)
-    version: Mapped[int] = mapped_column(sa.Integer, primary_key=True)
-    ast_hash: Mapped[str | None] = mapped_column(sa.String(64), nullable=True)
-    registered_at: Mapped[datetime] = mapped_column(
-        sa.TIMESTAMP(timezone=True),
-        server_default=sa.func.now(),
-        nullable=False,
+
+_TS = sa.TIMESTAMP(timezone=True)
+
+
+class Definition(_FlowBase):
+    __tablename__ = "definition"
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.UUID(as_uuid=True), primary_key=True, default=uuid.uuid7)
+    namespace: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    key: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    checksum: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    model: Mapped[JsonObject] = mapped_column(JSONB, nullable=False)
+    source: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(_TS, nullable=False, server_default=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint("version >= 1", name="ck_definition_version_positive"),
+        sa.UniqueConstraint("namespace", "key", "version", name="uq_definition_version"),
+        sa.UniqueConstraint("namespace", "key", "checksum", name="uq_definition_checksum"),
     )
 
 
-class Run(_FlowBase):
-    __tablename__ = "run"
+class Instance(_FlowBase):
+    __tablename__ = "instance"
 
     id: Mapped[uuid.UUID] = mapped_column(sa.UUID(as_uuid=True), primary_key=True, default=uuid.uuid7)
-    workflow_name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
-    workflow_version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    namespace: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    key: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    definition_id: Mapped[uuid.UUID] = mapped_column(
+        sa.UUID(as_uuid=True), sa.ForeignKey(f"{_SCHEMA}.definition.id"), nullable=False
+    )
     status: Mapped[str] = mapped_column(sa.String(16), nullable=False)
     input: Mapped[JsonObject] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
-    output: Mapped[JsonObject | None] = mapped_column(JSONB, nullable=True)
-    error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    variables: Mapped[JsonObject] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     metadata_: Mapped[JsonObject] = mapped_column(
-        "metadata",
-        JSONB,
-        nullable=False,
-        server_default=sa.text("'{}'::jsonb"),
+        "metadata", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
     )
-    triggered_by: Mapped[str] = mapped_column(sa.String(32), nullable=False, server_default=sa.text("'manual'"))
-    # NOT NULL and indexed: it is half of the keyset sort key
-    # `(started_at, id)`. A row comparison against a NULL evaluates to NULL and
-    # silently drops the row from the page, so a nullable sort key is a
-    # correctness bug, not a style choice.
-    started_at: Mapped[datetime] = mapped_column(
-        sa.TIMESTAMP(timezone=True),
-        nullable=False,
-        server_default=sa.func.now(),
-    )
-    finished_at: Mapped[datetime | None] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=True)
-    cancelled_at: Mapped[datetime | None] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     cancel_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
-    heartbeat_at: Mapped[datetime | None] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=True)
+    triggered_by: Mapped[str] = mapped_column(sa.String(16), nullable=False, server_default=sa.text("'manual'"))
+    parent_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.UUID(as_uuid=True), sa.ForeignKey(f"{_SCHEMA}.instance.id", ondelete="CASCADE"), nullable=True
+    )
+    parent_element_id: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(_TS, nullable=False, server_default=sa.func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(_TS, nullable=True)
 
-    steps: Mapped[list[StepRun]] = relationship(
-        "StepRun",
-        back_populates="run",
+    elements: Mapped[list[ElementRun]] = relationship(
+        "ElementRun",
+        back_populates="instance",
         cascade="all, delete-orphan",
         lazy="selectin",
-        order_by="StepRun.step_index, StepRun.started_at",
+        foreign_keys="ElementRun.instance_id",
+        order_by="ElementRun.started_at, ElementRun.id",
     )
 
     __table_args__ = (
-        sa.CheckConstraint(_STATUS_CHECK, name="ck_run_status"),
-        sa.Index("ix_run_workflow_name", "workflow_name"),
-        sa.Index("ix_run_status", "status"),
-        sa.Index("ix_run_metadata_gin", "metadata", postgresql_using="gin"),
-        sa.Index("ix_run_input_gin", "input", postgresql_using="gin", postgresql_ops={"input": "jsonb_path_ops"}),
-        sa.Index("ix_run_started_at_id", sa.desc("started_at"), sa.desc("id")),
-        sa.Index("ix_run_status_heartbeat", "status", "heartbeat_at"),
+        sa.CheckConstraint(_INSTANCE_STATUS_CHECK, name="ck_instance_status"),
+        sa.CheckConstraint(_TRIGGERED_BY_CHECK, name="ck_instance_triggered_by"),
+        sa.CheckConstraint("(parent_instance_id IS NULL) = (parent_element_id IS NULL)", name="ck_instance_parent"),
+        sa.Index("ix_instance_namespace_key", "namespace", "key"),
+        sa.Index("ix_instance_status", "status"),
+        sa.Index("ix_instance_parent", "parent_instance_id"),
+        sa.Index("ix_instance_metadata_gin", "metadata", postgresql_using="gin"),
+        sa.Index(
+            "ix_instance_variables_gin",
+            "variables",
+            postgresql_using="gin",
+            postgresql_ops={"variables": "jsonb_path_ops"},
+        ),
+        sa.Index("ix_instance_started_at_id", sa.desc("started_at"), sa.desc("id")),
     )
 
 
-class StepRun(_FlowBase):
-    __tablename__ = "step_run"
+class ElementRun(_FlowBase):
+    __tablename__ = "element_run"
 
     id: Mapped[uuid.UUID] = mapped_column(sa.UUID(as_uuid=True), primary_key=True, default=uuid.uuid7)
-    run_id: Mapped[uuid.UUID] = mapped_column(
-        sa.UUID(as_uuid=True),
-        sa.ForeignKey(f"{_SCHEMA}.run.id", ondelete="CASCADE"),
-        nullable=False,
+    instance_id: Mapped[uuid.UUID] = mapped_column(
+        sa.UUID(as_uuid=True), sa.ForeignKey(f"{_SCHEMA}.instance.id", ondelete="CASCADE"), nullable=False
     )
-    step_name: Mapped[str] = mapped_column(sa.String(255), nullable=False)
-    step_qualname: Mapped[str] = mapped_column(sa.String(512), nullable=False)
-    step_index: Mapped[int] = mapped_column(sa.Integer, nullable=False)
-    args_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    element_id: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    element_type: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    task_type: Mapped[str | None] = mapped_column(sa.String(255), nullable=True)
     status: Mapped[str] = mapped_column(sa.String(16), nullable=False)
-    output: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    output: Mapped[JsonObject | None] = mapped_column(JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
     attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("0"))
-    max_attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False)
-    next_attempt_at: Mapped[datetime | None] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=True)
-    heartbeat_at: Mapped[datetime | None] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=True)
+    max_attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default=sa.text("1"))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(_TS, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(_TS, nullable=False, server_default=sa.func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(_TS, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(_TS, nullable=True)
+    input: Mapped[JsonObject | None] = mapped_column(JSONB, nullable=True)
+    child_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.UUID(as_uuid=True), sa.ForeignKey(f"{_SCHEMA}.instance.id", ondelete="SET NULL"), nullable=True
+    )
 
-    run: Mapped[Run] = relationship("Run", back_populates="steps")
-
-    skipped: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.text("false"))
+    instance: Mapped[Instance] = relationship("Instance", back_populates="elements", foreign_keys=[instance_id])
 
     __table_args__ = (
-        # The memoisation key. A completed row here is what makes a re-run skip
-        # a step instead of repeating its side effects, so the uniqueness has to
-        # hold under concurrency — which only a database constraint does.
-        sa.UniqueConstraint("run_id", "step_qualname", "args_hash", name="uq_step_run_identity"),
-        sa.CheckConstraint(_STATUS_CHECK, name="ck_step_run_status"),
-        sa.CheckConstraint("attempts >= 0", name="ck_step_run_attempts_non_negative"),
-        sa.CheckConstraint("max_attempts >= 1", name="ck_step_run_max_attempts_positive"),
-        sa.CheckConstraint("NOT skipped OR status = 'completed'", name="ck_step_run_skipped_is_completed"),
-        sa.Index("ix_step_run_status_heartbeat", "status", "heartbeat_at"),
-        sa.Index("ix_step_run_run_id_index", "run_id", "step_index"),
+        sa.CheckConstraint(_ELEMENT_STATUS_CHECK, name="ck_element_run_status"),
+        sa.CheckConstraint("attempts >= 0 AND max_attempts >= 1", name="ck_element_run_attempts"),
+        sa.UniqueConstraint("instance_id", "element_id", name="uq_element_run_identity"),
+        sa.Index(
+            "ix_element_run_job",
+            "task_type",
+            "next_attempt_at",
+            postgresql_where=sa.column("status") == "pending",
+        ),
+        sa.Index("ix_element_run_running", "heartbeat_at", postgresql_where=sa.column("status") == "running"),
     )
 
 
-class RunEvent(_FlowBase):
-    """Append-only progress log for a run."""
-
-    __tablename__ = "run_event"
+class InstanceEvent(_FlowBase):
+    __tablename__ = "instance_event"
 
     id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True, autoincrement=True)
-    run_id: Mapped[uuid.UUID] = mapped_column(
-        sa.UUID(as_uuid=True),
-        sa.ForeignKey(f"{_SCHEMA}.run.id", ondelete="CASCADE"),
-        nullable=False,
+    instance_id: Mapped[uuid.UUID] = mapped_column(
+        sa.UUID(as_uuid=True), sa.ForeignKey(f"{_SCHEMA}.instance.id", ondelete="CASCADE"), nullable=False
     )
-    ts: Mapped[datetime] = mapped_column(sa.TIMESTAMP(timezone=True), server_default=sa.func.now(), nullable=False)
+    ts: Mapped[datetime] = mapped_column(_TS, nullable=False, server_default=sa.func.now())
     event_type: Mapped[str] = mapped_column(sa.String(64), nullable=False)
     payload: Mapped[JsonObject] = mapped_column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
 
-    __table_args__ = (sa.Index("ix_run_event_run_id_ts", "run_id", "ts"),)
+    __table_args__ = (sa.Index("ix_instance_event_instance_id", "instance_id", "id"),)
 
 
-class ScheduledRun(_FlowBase):
-    __tablename__ = "scheduled_run"
+class Schedule(_FlowBase):
+    __tablename__ = "schedule"
 
-    workflow_name: Mapped[str] = mapped_column(sa.String(255), primary_key=True)
-    workflow_version: Mapped[int] = mapped_column(sa.Integer, primary_key=True)
+    namespace: Mapped[str] = mapped_column(sa.String(255), primary_key=True)
+    key: Mapped[str] = mapped_column(sa.String(255), primary_key=True)
     cron: Mapped[str] = mapped_column(sa.String(128), nullable=False)
     enabled: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.true())
-    last_fired_at: Mapped[datetime | None] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=True)
-    next_fire_at: Mapped[datetime] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=False)
+    last_fired_at: Mapped[datetime | None] = mapped_column(_TS, nullable=True)
+    next_fire_at: Mapped[datetime] = mapped_column(_TS, nullable=False)
 
-    __table_args__ = (
-        sa.ForeignKeyConstraint(
-            ["workflow_name", "workflow_version"],
-            [f"{_SCHEMA}.workflow.name", f"{_SCHEMA}.workflow.version"],
-            ondelete="CASCADE",
-        ),
-        sa.Index("ix_scheduled_run_due", "next_fire_at", postgresql_where=sa.column("enabled")),
-    )
+    __table_args__ = (sa.Index("ix_schedule_due", "next_fire_at", postgresql_where=sa.column("enabled")),)
 
 
-__all__ = [
-    "Run",
-    "RunEvent",
-    "ScheduledRun",
-    "StepRun",
-    "Workflow",
-]
+__all__ = ["Definition", "ElementRun", "Instance", "InstanceEvent", "Schedule"]

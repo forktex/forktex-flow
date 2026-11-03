@@ -21,18 +21,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Shared testcontainer factories.
-
-Postgres only: this library talks to exactly one piece of infrastructure. The
-image tag is pinned (not ``:latest``) so CI is reproducible and a breaking
-upstream push cannot fail the suite without a deliberate bump here.
-
-``start_postgres`` returns ``(container, url)``. The caller is responsible for
-``container.stop()`` on teardown.
-
-The default is the version the suite develops against; ``image`` exists so the
-floor the README advertises can be exercised too, rather than asserted.
-"""
+"""A pinned Postgres image by default; ``image`` runs another version."""
 
 from __future__ import annotations
 
@@ -47,7 +36,7 @@ DEFAULT_IMAGE = "postgres:17-alpine"
 
 def start_postgres(image: str = DEFAULT_IMAGE) -> tuple[Any, URL]:
     """Start Postgres. Returns ``(container, asyncpg URL)``."""
-    from testcontainers.postgres import PostgresContainer
+    from testcontainers.community.postgres import PostgresContainer
 
     container = PostgresContainer(image)
     container.start()

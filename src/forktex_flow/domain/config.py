@@ -30,9 +30,10 @@ from pydantic import model_validator
 
 
 class RuntimeConfig(BaseValueObject):
-    """How hard the driver polls, and how patient it is with a stalled step. Must exceed ``heartbeat_interval``, or
-    a healthy step gets reclaimed out from under itself. max_attempts: Default attempts per step, when ``@step``
-    does not override it.
+    """How hard a driver polls and how patient it is with a stalled job. ``stale_threshold`` must exceed
+    ``heartbeat_interval``, or a healthy job is reclaimed out from under itself. ``max_attempts`` and ``backoff``
+    apply to a service task that declares no ``retries`` or ``backoff`` of its own; ``max_concurrent_jobs`` caps
+    the jobs one ``Flow`` runs at once.
     """
 
     poll_interval: float = 1.0
@@ -40,9 +41,12 @@ class RuntimeConfig(BaseValueObject):
     heartbeat_interval: float = 10.0
     stale_threshold: float = 60.0
     max_attempts: int = 3
-    max_concurrent_runs: int = 10
+    max_concurrent_jobs: int = 10
     backoff: tuple[float, ...] = (30.0, 120.0, 300.0)
     leader_lock_key: int = 0
+    #: How long stopping the driver waits for running jobs before handing them back. Keep the host's stop grace
+    #: period above it.
+    drain_timeout: float = 25.0
 
     @model_validator(mode="after")
     def _check(self) -> RuntimeConfig:
@@ -52,14 +56,13 @@ class RuntimeConfig(BaseValueObject):
             raise BadRequestError("backoff must be a non-empty tuple")
         if self.poll_interval <= 0:
             raise BadRequestError("poll_interval must be > 0")
-        if self.max_concurrent_runs < 1:
-            raise BadRequestError("max_concurrent_runs must be >= 1")
+        if self.max_concurrent_jobs < 1:
+            raise BadRequestError("max_concurrent_jobs must be >= 1")
         if self.election_interval <= 0:
             raise BadRequestError("election_interval must be > 0")
+        if self.drain_timeout <= 0:
+            raise BadRequestError("drain_timeout must be > 0")
         if self.stale_threshold <= self.heartbeat_interval:
-            # A lower threshold lets the reclaim scan find a step whose heartbeat is merely
-            # *due* and hands it to a second worker, which is how one step body
-            # ends up running twice.
             raise BadRequestError(
                 f"stale_threshold ({self.stale_threshold}) must exceed heartbeat_interval ({self.heartbeat_interval})"
             )

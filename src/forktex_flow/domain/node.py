@@ -27,34 +27,33 @@ positionally.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import Any, overload
 
 from forktex.error import BadRequestError
 from forktex.types import BaseValueObject
 
-from forktex_flow.domain.config import RuntimeConfig
-
-# Attribute the @step decorator attaches to a function to carry its retry
-# contract. Named here once so call sites read it via ``step_meta`` rather
-# than repeating the dunder string.
 _STEP_META_ATTR = "__forktex_step_meta__"
-
-#: The retry contract a bare `@step` gets. Read from `RuntimeConfig`'s own
-#: defaults rather than restated here: the same two numbers written in three
-#: places is how a consumer sets `RuntimeConfig(max_attempts=7)` and every step
-#: still gets 3.
-_DEFAULTS = RuntimeConfig()
 
 
 class StepMeta(BaseValueObject):
-    max_attempts: int
-    backoff: tuple[float, ...]
+    """A step's own retry contract; what it leaves unset comes from the ``Flow``'s ``RuntimeConfig``."""
+
+    max_attempts: int | None = None
+    backoff: tuple[float, ...] | None = None
+
+
+#: ``async def fn(ctx: Ctx, variables: dict[str, Any]) -> dict[str, Any] | None`` — a handler returns the output
+#: merged into the instance's variables.
+HandlerFn = Callable[[Any, dict[str, Any]], Coroutine[Any, Any, dict[str, Any] | None]]
+
+#: A pipeline step's guard, evaluated against the variables before the step runs.
+WhenFn = Callable[[dict[str, Any]], bool]
 
 
 class StepSpec(BaseValueObject):
     fn: Callable[..., Any]
-    when: Callable[[dict[str, Any]], bool] | None = None
+    when: WhenFn | None = None
     max_attempts: int | None = None
     backoff: tuple[float, ...] | None = None
 
@@ -64,15 +63,10 @@ def step_meta(fn: object) -> StepMeta | None:
     return meta if isinstance(meta, StepMeta) else None
 
 
-def has_step_meta(fn: object) -> bool:
-    return isinstance(getattr(fn, _STEP_META_ATTR, None), StepMeta)
-
-
 # The three call shapes, declared separately so a caller gets the type it
 # actually receives. A single union return is technically true and practically
 # useless: `@step` hands back the function unchanged, but a union makes every
-# later `step(decorated, when=...)` and `scheduled(...)(decorated)` an error —
-# 13 of them in ForkTex Cloud, against code written exactly as the README shows.
+# later `step(decorated, when=...)` and `scheduled(...)(decorated)` a type error.
 @overload
 def step(fn: Callable[..., Any], /) -> Callable[..., Any]: ...
 
@@ -107,33 +101,18 @@ def step(
     backoff: tuple[float, ...] | None = None,
     when: Callable[[dict[str, Any]], bool] | None = None,
 ) -> Callable[..., Any] | StepSpec:
-    """Attach a retry contract to a step, or build a guarded pipeline entry. ``fn`` must be positional."""
-    resolved_max_attempts = max_attempts if max_attempts is not None else _DEFAULTS.max_attempts
-    resolved_backoff = backoff if backoff is not None else _DEFAULTS.backoff
-
-    def _attach_meta(target: Callable[..., Any]) -> Callable[..., Any]:
-        meta = StepMeta(max_attempts=resolved_max_attempts, backoff=resolved_backoff)
-        setattr(target, _STEP_META_ATTR, meta)
-        return target
-
+    """Attach a retry contract to a step, or build a guarded pipeline entry. ``fn`` must be positional; a bare
+    ``@step`` changes nothing.
+    """
     if fn is None:
         if when is not None:
-            # `when` selects a step *within a pipeline*, so it is meaningless
-            # without the function it guards. Raising here turns a silently
-            # ignored guard into an error at import time.
             raise BadRequestError("step(when=...) requires fn as a positional argument")
-        return _attach_meta
 
+        def _attach(target: Callable[..., Any]) -> Callable[..., Any]:
+            setattr(target, _STEP_META_ATTR, StepMeta(max_attempts=max_attempts, backoff=backoff))
+            return target
+
+        return _attach
     if when is not None or max_attempts is not None or backoff is not None:
         return StepSpec(fn=fn, when=when, max_attempts=max_attempts, backoff=backoff)
-
-    return _attach_meta(fn)
-
-
-__all__ = [
-    "StepMeta",
-    "StepSpec",
-    "has_step_meta",
-    "step",
-    "step_meta",
-]
+    return fn

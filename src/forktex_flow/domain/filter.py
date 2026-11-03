@@ -25,21 +25,24 @@
 from __future__ import annotations
 
 from datetime import datetime
+from uuid import UUID
 
 from forktex.types import BaseValueObject, JsonObject
 from pydantic import Field
 
 
-class RunFilter(BaseValueObject):
-    workflow_name: str | None = None
-    workflow_version: int | None = None
+class InstanceFilter(BaseValueObject):
+    namespace: str | None = None
+    key: str | None = None
+    version: int | None = None
     statuses: tuple[str, ...] = ()
     metadata_filter: JsonObject = Field(default_factory=dict)
-    state_filter: JsonObject = Field(default_factory=dict)
-    current_nodes: tuple[str, ...] = ()
+    variables_filter: JsonObject = Field(default_factory=dict)
+    current_elements: tuple[str, ...] = ()
+    parent_instance_id: UUID | None = None
     since: datetime | None = None
     until: datetime | None = None
     triggered_by: tuple[str, ...] = ()
 
 
-__all__ = ["RunFilter"]
+__all__ = ["InstanceFilter"]

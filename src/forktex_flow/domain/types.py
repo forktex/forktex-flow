@@ -28,73 +28,87 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from forktex.types import BaseValueObject, BaseWireValueObject, JsonObject, JsonValue
+from forktex.types import BaseValueObject, BaseWireValueObject, JsonObject
 from pydantic import Field
 
-#: Runs and steps share one status vocabulary — a step is a run's work in
-#: miniature, and two lists that must stay identical are one list. Both names
-#: are exported so a signature can say which it means; the CHECK constraints in
-#: the migrations are what actually enforce the values.
-RunStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
-StepStatus = RunStatus
+from forktex_flow.domain.process import ProcessModel
 
-#: The statuses a run does not leave, and at which it acquires a ``finished_at``.
-#: Polling and streaming stop here.
+InstanceStatus = Literal["active", "completed", "failed", "cancelled"]
+ElementStatus = Literal["pending", "running", "waiting", "completed", "skipped", "failed", "cancelled"]
+TriggeredBy = Literal["manual", "schedule", "call"]
+
+#: The statuses an instance does not leave, and at which it acquires a ``finished_at``.
 TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
 
-#: The extension hooks dispatched by name once a run reaches a terminal status.
+#: The element statuses that still hold the instance's token.
+OPEN_ELEMENT_STATUSES: tuple[str, ...] = ("pending", "running", "waiting")
+
+#: The namespace a code-declared workflow lives in, and the one every call defaults to.
+DEFAULT_NAMESPACE = "default"
+
 TerminalHook = Literal["after_complete", "after_fail"]
 
 
-class StepRunInfo(BaseWireValueObject):
-    step_id: UUID
-    step_name: str
-    step_index: int
-    status: StepStatus
-    output: JsonValue
-    error: str | None
-    attempts: int
-    started_at: datetime | None
-    finished_at: datetime | None
-    heartbeat_at: datetime | None
+class DefinitionInfo(BaseWireValueObject):
+    definition_id: UUID
+    namespace: str
+    key: str
+    version: int
+    checksum: str
+    model: ProcessModel
+    #: What was deployed, verbatim: BPMN XML as given, or the model's JSON.
+    source: str
+    created_at: datetime
 
 
-class RunClaim(BaseValueObject):
-    run_id: UUID
-    workflow_name: str
-    workflow_version: int
-
-
-class StepSlot(BaseValueObject):
-    """The row for one step invocation, and whatever it already recorded. ``status == "completed"`` is the
-    memoisation hit: ``output`` is the cached delta and the body must not run again.
-    """
-
-    step_id: UUID
-    status: StepStatus
-    output: JsonValue
-    skipped: bool = False
-
-
-class RunInfo(BaseWireValueObject):
-    run_id: UUID
-    workflow_name: str
-    workflow_version: int
-    status: RunStatus
-    input: JsonObject
+class ElementRunInfo(BaseWireValueObject):
+    element_run_id: UUID
+    element_id: str
+    element_type: str
+    task_type: str | None
+    status: ElementStatus
     output: JsonObject | None
     error: str | None
-    metadata: JsonObject
+    attempts: int
+    max_attempts: int
+    next_attempt_at: datetime | None
     started_at: datetime
     finished_at: datetime | None
-    steps: list[StepRunInfo] = Field(default_factory=list)
+    heartbeat_at: datetime | None
+    child_instance_id: UUID | None
+    input: JsonObject | None = None
 
 
-class RunSummary(BaseWireValueObject):
-    """Aggregate statistics over a matching set of runs. ``p95_duration_seconds`` is the worst per-status p95, not
-    a true global one — computing that needs an ungrouped pass, which the name does not suggest.
-    """
+class InstanceInfo(BaseWireValueObject):
+    instance_id: UUID
+    namespace: str
+    key: str
+    version: int
+    definition_id: UUID
+    status: InstanceStatus
+    input: JsonObject
+    variables: JsonObject
+    metadata: JsonObject
+    error: str | None
+    cancel_reason: str | None
+    triggered_by: TriggeredBy
+    parent_instance_id: UUID | None
+    parent_element_id: str | None
+    started_at: datetime
+    finished_at: datetime | None
+    elements: list[ElementRunInfo] = Field(default_factory=list)
 
+
+class Job(BaseValueObject):
+    element_run_id: UUID
+    instance_id: UUID
+    element_id: str
+    task_type: str
+    attempts: int
+    max_attempts: int
+
+
+class InstanceSummary(BaseWireValueObject):
     total: int
     by_status: dict[str, int]
     avg_duration_seconds: float | None
@@ -104,13 +118,16 @@ class RunSummary(BaseWireValueObject):
 
 
 __all__ = [
+    "DEFAULT_NAMESPACE",
+    "OPEN_ELEMENT_STATUSES",
     "TERMINAL_STATUSES",
-    "RunClaim",
-    "RunInfo",
-    "RunStatus",
-    "RunSummary",
-    "StepRunInfo",
-    "StepSlot",
-    "StepStatus",
+    "DefinitionInfo",
+    "ElementRunInfo",
+    "ElementStatus",
+    "InstanceInfo",
+    "InstanceStatus",
+    "InstanceSummary",
+    "Job",
     "TerminalHook",
+    "TriggeredBy",
 ]

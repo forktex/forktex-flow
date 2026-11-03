@@ -21,16 +21,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Run a real workflow using the INSTALLED package, not the source tree.
-
-`make ci`'s test suite imports `forktex_flow` from `src/`. That cannot see the
-one failure class packaging introduces: everything resolving from `src/` and not
-from site-packages — a missing `__init__`, a data file left out of the wheel, a
-module that only imports because the repo root happens to be on `sys.path`.
-
-So this executes from a throwaway venv with only the built wheel installed, and
-refuses to run against a source checkout.
-"""
+"""Run a workflow from the installed wheel; refuses to run against a source checkout."""
 
 from __future__ import annotations
 
@@ -63,59 +54,48 @@ def _assert_running_from_site_packages() -> None:
 async def main() -> int:
     _assert_running_from_site_packages()
 
-    from forktex_flow import Ctx, Flow, step
-    from forktex_flow.runtime.context import FlowRuntime
-    from forktex_flow.runtime.execution import execute_run
-    from testcontainers.postgres import PostgresContainer
+    from forktex_flow import Ctx, Flow, RuntimeConfig, step
+    from testcontainers.community.postgres import PostgresContainer
 
     container = PostgresContainer("postgres:17-alpine")
     container.start()
     parsed = urlparse(container.get_connection_url())
-    url = (
-        f"postgresql+asyncpg://{parsed.username}:{parsed.password}"
-        f"@{parsed.hostname}:{parsed.port}{parsed.path}"
-    )
+    url = f"postgresql+asyncpg://{parsed.username}:{parsed.password}@{parsed.hostname}:{parsed.port}{parsed.path}"
     schema = "forktex_flow_" + uuid.uuid7().hex
-    flow = Flow(url, schema=schema)
+    config = RuntimeConfig(poll_interval=0.05, election_interval=0.05, heartbeat_interval=0.5, stale_threshold=2)
+    flow = Flow(url, schema=schema, config=config, drive=True)
+
+    async def first(ctx: Ctx, state: State) -> dict:
+        return {"logs": ["first"]}
+
+    async def guarded(ctx: Ctx, state: State) -> dict:
+        return {"logs": ["guarded"]}
+
+    @flow.pipeline("smoke.pipeline", state=State)
+    class Smoke:
+        steps = [first, step(guarded, when=lambda s: s.get("enabled", False))]
 
     try:
-        # Proves the .sql migrations shipped AND that the runner can find them
-        # through importlib's view of the installed package.
-        await flow.init()
-        print("  schema migrated from the packaged .sql")
+        # Proves the .sql migrations shipped AND that the runner finds them through the installed package.
+        async with flow:
+            print("  schema migrated from the packaged .sql; driver started")
+            instance = await flow.start("smoke.pipeline", variables={"logs": [], "enabled": True})
+            final = await instance.wait(timeout=30)
 
-        async def first(ctx: Ctx, state: State) -> dict:
-            return {"logs": ["first"]}
+            assert final.status == "completed", final.status
+            assert final.variables["logs"] == ["first", "guarded"], final.variables["logs"]
+            print(f"  ran a 2-step pipeline: {final.status}, logs={final.variables['logs']}")
 
-        async def guarded(ctx: Ctx, state: State) -> dict:
-            return {"logs": ["guarded"]}
-
-        @flow.pipeline("smoke.pipeline", version=1, state=State)
-        class Smoke:
-            steps = [first, step(guarded, when=lambda s: s.get("enabled", False))]
-
-        instance = await flow.run("smoke.pipeline", state={"logs": [], "enabled": True})
-        await execute_run(
-            FlowRuntime(flow._store, flow._registry, flow._config, flow.extensions),
-            instance.instance_id,
-            "smoke.pipeline",
-            1,
-        )
-        final = await flow.get(instance.instance_id)
-
-        assert final.status == "completed", final.status
-        assert final.state["logs"] == ["first", "guarded"], final.state["logs"]
-        print(f"  ran a 2-step pipeline: {final.status}, logs={final.state['logs']}")
-
-        page = await flow.query().workflow("smoke.pipeline").fetch()
-        assert len(page.items) == 1
-        print("  query round-trips")
+            page = await flow.query().key("smoke.pipeline").fetch()
+            assert len(page.items) == 1
+            print("  query round-trips")
     finally:
         from sqlalchemy import text
 
-        async with flow.engine.begin() as conn:
+        cleanup = Flow(url, schema=schema)
+        async with cleanup.engine.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
-        await flow.close()
+        await cleanup.close()
         container.stop()
 
     print("wheel-smoke: the installed package runs a workflow end to end")

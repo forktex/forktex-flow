@@ -21,47 +21,77 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""ORM row → domain value object. The direction is one-way — persist knows about domain, never the reverse."""
+"""ORM row → domain value object. One-way: persist knows about domain, never the reverse."""
 
 from __future__ import annotations
 
 from typing import cast
 
-from forktex_flow.domain.types import RunInfo, RunStatus, StepRunInfo, StepStatus
-from forktex_flow.persist.models import Run, StepRun
+from forktex_flow.domain.process import ProcessModel
+from forktex_flow.domain.types import (
+    DefinitionInfo,
+    ElementRunInfo,
+    ElementStatus,
+    InstanceInfo,
+    InstanceStatus,
+    TriggeredBy,
+)
+from forktex_flow.persist.models import Definition, ElementRun, Instance
 
-__all__ = ["to_run_info", "to_step_info"]
+__all__ = ["to_definition_info", "to_element_info", "to_instance_info"]
 
 
-def to_run_info(row: Run) -> RunInfo:
-    return RunInfo(
-        run_id=row.id,
-        workflow_name=row.workflow_name,
-        workflow_version=row.workflow_version,
-        # The column is a plain VARCHAR; `ck_run_status` is what restricts it to
-        # the five values `RunStatus` names, so the narrowing is guaranteed by the
-        # schema rather than merely asserted here.
-        status=cast(RunStatus, row.status),
-        input=row.input or {},
-        output=row.output,
-        error=row.error,
-        metadata=row.metadata_ or {},
-        started_at=row.started_at,
-        finished_at=row.finished_at,
-        steps=[to_step_info(s) for s in row.steps],
+def to_definition_info(row: Definition) -> DefinitionInfo:
+    return DefinitionInfo(
+        definition_id=row.id,
+        namespace=row.namespace,
+        key=row.key,
+        version=row.version,
+        checksum=row.checksum,
+        model=ProcessModel.model_validate(row.model),
+        source=row.source,
+        created_at=row.created_at,
     )
 
 
-def to_step_info(row: StepRun) -> StepRunInfo:
-    return StepRunInfo(
-        step_id=row.id,
-        step_name=row.step_name,
-        step_index=row.step_index,
-        status=cast(StepStatus, row.status),  # see the note in `to_run_info`
+def to_instance_info(row: Instance) -> InstanceInfo:
+    # The status columns are plain VARCHARs restricted by CHECK constraints built from the same Literals.
+    return InstanceInfo(
+        instance_id=row.id,
+        namespace=row.namespace,
+        key=row.key,
+        version=row.version,
+        definition_id=row.definition_id,
+        status=cast(InstanceStatus, row.status),
+        input=row.input or {},
+        variables=row.variables or {},
+        metadata=row.metadata_ or {},
+        error=row.error,
+        cancel_reason=row.cancel_reason,
+        triggered_by=cast(TriggeredBy, row.triggered_by),
+        parent_instance_id=row.parent_instance_id,
+        parent_element_id=row.parent_element_id,
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+        elements=[to_element_info(element) for element in row.elements],
+    )
+
+
+def to_element_info(row: ElementRun) -> ElementRunInfo:
+    return ElementRunInfo(
+        element_run_id=row.id,
+        element_id=row.element_id,
+        element_type=row.element_type,
+        task_type=row.task_type,
+        status=cast(ElementStatus, row.status),
         output=row.output,
         error=row.error,
         attempts=row.attempts,
+        max_attempts=row.max_attempts,
+        next_attempt_at=row.next_attempt_at,
         started_at=row.started_at,
         finished_at=row.finished_at,
         heartbeat_at=row.heartbeat_at,
+        child_instance_id=row.child_instance_id,
+        input=row.input,
     )

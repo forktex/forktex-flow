@@ -25,11 +25,14 @@
 from __future__ import annotations
 
 import annotationlib
+import json
 from collections.abc import Callable
 from typing import Annotated, Any, get_args, get_origin
 
 from forktex.log import get_logger
 from forktex.types import JsonObject
+
+from forktex_flow.errors import StateNotSerialisable
 
 #: ``reducer(existing, incoming) -> merged``.
 logger = get_logger(__name__)
@@ -38,9 +41,8 @@ ReducerFn = Callable[[Any, Any], Any]
 
 
 def extract_reducers(state_cls: type | None) -> dict[str, ReducerFn]:
-    """Build ``{field: reducer}`` from a state class's ``Annotated`` hints. A state class under ``from __future__
-    import annotations`` holding a name that exists only for the type checker cannot be resolved as a whole, and
-    resolving it as a whole would drop every reducer beside the unresolvable field.
+    """Build ``{field: reducer}`` from a state class's ``Annotated`` hints, one field at a time, so a field whose
+    annotation cannot be resolved loses only its own reducer.
     """
     if state_cls is None:
         return {}
@@ -62,9 +64,8 @@ def apply_state_update(
     update: JsonObject,
     reducers: dict[str, ReducerFn],
 ) -> JsonObject:
-    """Merge a step's partial ``update`` into ``current`` using ``reducers``. A key with no reducer, or no existing
-    value, takes the new value as-is; a reducer is never called against a missing key, so ``operator.add`` on
-    the first write does not have to cope with ``None``.
+    """Merge a handler's partial ``update`` into ``current`` using ``reducers``. A key with no reducer, or no existing
+    value, takes the new value as-is.
     """
     result = dict(current)
     for key, new_value in update.items():
@@ -75,7 +76,21 @@ def apply_state_update(
     return result
 
 
-__all__ = ["ReducerFn", "apply_state_update", "extract_reducers"]
+def check_variables(output: object) -> None:
+    """Raise ``StateNotSerialisable`` unless ``output`` is ``None`` or a dict JSONB can hold."""
+    if output is None:
+        return
+    if not isinstance(output, dict):
+        raise StateNotSerialisable(f"variables are a dict, got {type(output).__name__}")
+    try:
+        json.dumps(output)
+    except TypeError as exc:
+        raise StateNotSerialisable(
+            f"variables cannot be written to JSONB ({exc}); carry an id and build the object inside the handler"
+        ) from exc
+
+
+__all__ = ["ReducerFn", "apply_state_update", "check_variables", "extract_reducers"]
 
 
 def _resolved_hints(state_cls: type) -> dict[str, object]:

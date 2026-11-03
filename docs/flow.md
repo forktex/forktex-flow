@@ -1,304 +1,338 @@
-# `forktex_flow` — reference
+# `forktex_flow` reference
 
-The complete public surface, the semantics behind it, and the things that will
-surprise you. For orientation and usage patterns, start with the
-[README](../README.md); this page is what you read when you need the exact
-behaviour of something.
+Every public name and its exact behaviour. The [README](../README.md) shows how
+to wire it in; [`operating.md`](operating.md) covers failure and operations.
 
 ## Public surface
 
-`forktex_flow.__all__` is the contract — 28 names, frozen by test. Everything
-else is internal. Each name has its own section below unless the gloss says it
-all.
+`forktex_flow.__all__` is the contract. Everything else is internal.
 
 | Name | What it is |
 |---|---|
-| `Flow` | The facade. One per process. |
-| `Ctx` | The per-step handle passed to every step body. |
-| `step` | Decorator, and pipeline-entry builder. |
-| `StepSpec` | What `step(fn, when=…)` returns. |
-| `WorkflowInstance` | A run: a snapshot plus `wait` / `refresh` / `stream` / `cancel`. |
-| `NodeInstance` | One step's execution record within a run. |
-| `InstanceQuery` | The fluent finder behind `Flow.query()`. |
-| `InstancePage` | One keyset page of `WorkflowInstance`. |
-| `RunInfo`, `StepRunInfo` | Row shapes persistence returns. |
-| `RunSummary` | Counts and duration percentiles over a match set. |
-| `RunStatus`, `StepStatus` | `pending` · `running` · `completed` · `failed` · `cancelled`. |
-| `TERMINAL_STATUSES` | The three a run does not leave. |
-| `RuntimeConfig` | Retry, polling and concurrency behaviour. |
-| `FlowExtension` | The consumer hook protocol. |
-| `FlowError`, `StepFailed`, `WorkflowFailed`, `WorkflowCancelled` | The error leaves. |
-| `StateNotSerialisable` | A state value JSONB cannot take. |
-| `FlowClosed` | An entry point called after `close()`. |
-| `apply_migrations` | Bring a schema up without constructing a `Flow`. |
-| `apply_state_update`, `extract_reducers` | Reducer machinery, for testing your own state classes. |
-| `make_ctx` | A `Ctx` for awaiting a step directly, with no database. |
-| `isolated_flow` | Context manager: a migrated `Flow` on a throwaway schema. |
-| `run_to_completion` | Dispatch and execute a run inline, without a driver. |
-
-`WorkflowDefinition`, `NodeDef`, `StepMeta` and `RunFilter` are what the
-decorators and the query builder compile *to* — importable from their modules,
-but not in the root surface: no consumer constructs one, and freezing them would
-make an internal representation an API.
+| `Flow` | The facade: one per process and schema. |
+| `Ctx` | The handle every handler is given. |
+| `step`, `StepSpec` | A pipeline step's retry contract, and a guarded pipeline entry. |
+| `ProcessModel` | A process definition: elements and sequence flows. |
+| `StartEvent`, `EndEvent`, `ServiceTask`, `UserTask`, `ExclusiveGateway`, `CallActivity`, `AdHocSubProcess`, `SequenceFlow` | Its parts. |
+| `AdHocDecision`, `Activation` | What an ad-hoc decider returns. |
+| `parse_bpmn` | BPMN 2.0 XML compiled to a `ProcessModel`. |
+| `DefinitionInfo` | One deployed version: `namespace`, `key`, `version`, `checksum`, `model`, `source`. |
+| `WorkflowInstance` | An instance snapshot, plus `wait` / `refresh` / `stream` / `cancel`. |
+| `InstanceInfo`, `ElementRunInfo` | The snapshot shapes. |
+| `InstanceStatus`, `ElementStatus`, `TERMINAL_STATUSES` | Status vocabularies; an instance never leaves a terminal status. |
+| `DEFAULT_NAMESPACE` | `"default"`: where code-declared workflows live, and every call's default. |
+| `InstanceQuery`, `InstancePage`, `InstanceSummary` | Finding instances. |
+| `RuntimeConfig` | Retry, polling and concurrency settings. |
+| `FlowExtension` | Lifecycle hooks. |
+| `FlowError`, `WorkflowFailed`, `WorkflowCancelled`, `StateNotSerialisable`, `FlowClosed` | The library's errors. |
+| `apply_migrations` | Bring a schema up without building a `Flow`. |
+| `apply_state_update`, `extract_reducers` | The reducer machinery, for testing state classes. |
+| `make_ctx`, `isolated_flow`, `run_to_completion`, `run_pending` | Testing helpers. |
 
 ## `Flow`
 
 ```python
-Flow(
-    database_url: str | None = None,
-    *,
-    database: Database | None = None,
-    schema: str = "forktex_flow",
-    extensions: list[FlowExtension] | None = None,
-    config: RuntimeConfig | None = None,
-    echo: bool = False,
-    **engine_kwargs,
-)
+Flow(database_url=None, *, database=None, schema="forktex_flow",
+     extensions=None, config=None, drive=False, echo=False, **engine_kwargs)
 ```
 
-Exactly one of `database_url` or `database`. A URL builds a pool this `Flow`
-owns and disposes on `close()`; a `Database` is yours and is left alone. When you
-pass one, its `schema_translate_map` must remap `forktex_flow` to `schema` — a
-mismatch logs a warning rather than failing: the tables resolve to whatever the
-map says, which may be intentional.
+| Argument | Default | Meaning |
+|---|---|---|
+| `database_url` | — | A DSN. The pool belongs to this `Flow`, and `close()` disposes it. |
+| `database` | — | A `forktex` `Database` you own, whose `schema_translate_map` remaps `forktex_flow` to `schema`. `close()` leaves it open. Pass exactly one of the two. |
+| `schema` | `forktex_flow` | The Postgres schema. Flows on different schemas share nothing. |
+| `extensions` | `None` | `FlowExtension` objects. |
+| `config` | `RuntimeConfig()` | See [`RuntimeConfig`](#runtimeconfig). |
+| `drive` | `False` | Whether `async with` also starts the driver. |
+| `echo`, `**engine_kwargs` | — | Passed to SQLAlchemy (`pool_size`, `pool_pre_ping`, …). |
 
-`engine_kwargs` go verbatim to `create_async_engine` (`pool_size`,
-`max_overflow`, `pool_pre_ping`, …).
+Nothing connects until something executes.
 
-Every method and argument is listed in the
-[README](../README.md#every-option-you-have). What it does not say:
+### Lifecycle
 
-- `init()` is safe from every worker at once — concurrent callers serialise on
-  an advisory lock.
-- `verify()` raises `DatabaseUnreachableError`, and is shaped for
-  `create_app(readiness_probes=...)`.
-- `start_driver()` called twice does not start a second loop, and
-  `stop_driver()` is safe before any start.
-- `run(version=None)` takes the highest registered version. Registering the same
-  `(name, version)` twice raises `AlreadyExistsError`.
-- `run()` labels the run `triggered_by="manual"`; the driver labels a cron
-  `"schedule"`. The `ck_run_triggered_by` constraint permits nothing else.
-- `get(run_id)` raises `NotFoundError` when the run does not exist.
-- `session()` hands out a read session on this `Flow`'s pool. The engine owns the
-  transaction, so `commit()` raises `TransactionBoundaryError`.
-
-## Steps
-
-A step is `async def fn(ctx: Ctx, state: dict) -> dict`. It returns the **delta**
-to merge, or `None` (treated as `{}`).
-
-```python
-@step                                          # defaults: 3 attempts, (30, 120, 300)
-@step(max_attempts=5, backoff=(10.0, 60.0))    # a decorator with a retry contract
-step(fn, when=predicate)                       # a guarded pipeline entry
-step(fn, max_attempts=7)                       # a per-call-site override
-```
-
-Bare `@step` returns the function unchanged, so a step stays an ordinary callable
-a unit test can await directly with a hand-built `Ctx` and no database.
-`step(when=…)` without a positional `fn` raises `BadRequestError` — a guard with
-nothing to guard is always a mistake.
-
-The same function may appear twice in one pipeline; the compiler suffixes by
-position (`work` and `work_2`). Position, not an occurrence counter, so a
-resumed run still matches the rows it already wrote.
-
-## `Ctx`
-
-| Field | |
+| Call | Does |
 |---|---|
-| `run_id`, `workflow_name`, `workflow_version` | Which run. |
-| `node_name`, `attempt` | Rewritten by the executor before each step call. |
-| `metadata` | What the run was started with, after `before_start` hooks. |
+| `async with flow:` | `init()`, plus `start_driver()` when `drive=True`; `close()` on exit. |
+| `await flow.init()` | Migrate the schema and deploy every declared workflow. Idempotent and safe from every process at once. |
+| `await flow.verify()` | Probe the pool and create nothing. Raises `DatabaseUnreachableError`. |
+| `await flow.start_driver()` | Start claiming jobs and standing for leadership. A second call is a no-op. |
+| `await flow.stop_driver()` | Stop claiming, give running jobs `drain_timeout`, and hand the rest back as pending without spending an attempt. |
+| `await flow.close()` | `stop_driver()`, then dispose an owned pool. Every later call raises `FlowClosed`. |
 
-| Method | |
+`flow.schema`, `flow.engine` and `flow.transaction()` expose the database for
+your own SQL against the engine's tables. A `transaction()` block commits on
+exit, so calling `commit()` inside it raises.
+
+### Declaring code workflows
+
+| Decorator | Declares |
 |---|---|
-| `await emit(event_type, payload=None)` | Append a row to this run's event log. |
-| `await sleep(seconds)` | Wait, in process. |
+| `@flow.pipeline(key, *, state=None, cron=None, enabled=True)` | A class whose `steps` list compiles to start → one service task per step → end. `cron=` also schedules it. |
+| `@flow.scheduled(key, *, cron, state=None, enabled=True)` | One async function on a cron. |
+| `@flow.handler(task_type)` | The function run for every service task (or ad-hoc decider) of that type. |
 
-`Ctx` is constructible without a database — `emit` is the only method that needs
-one, and it says so if it does not have one.
+- A step's element id is its function's name, suffixed by position when names
+  repeat or collide with `start` / `end`. Its task type is `<key>:<element id>`.
+- `state=` is a `TypedDict`. A field annotated with a reducer, such as
+  `Annotated[list[str], operator.add]`, accumulates; every other field is
+  last-write-wins. The reducers apply to that key in every namespace.
+- `enabled=False` declares a schedule disarmed. The flag is read only when the
+  schedule row is first written.
+- Declarations deploy into `DEFAULT_NAMESPACE` on `init()` or the first
+  `start()`. An unchanged one keeps its version.
+- `flow.registered()` lists the declared keys.
+- Declaring a key or task type twice raises `AlreadyExistsError`. A bad cron, or
+  a pipeline with no steps, raises `BadRequestError` when the decorator runs.
 
-## State and reducers
+A handler is `async def (ctx: Ctx, variables: dict) -> dict | BaseModel | None`.
+Its output merges into the instance's variables. Raising `WorkflowCancelled(reason)`
+cancels the instance.
 
-```python
-class State(TypedDict):
-    logs:      Annotated[list[str], operator.add]
-    server_id: str
+### `step`
+
+| Form | Effect |
+|---|---|
+| `@step(max_attempts=n, backoff=(a, b))` | Decorate a step with its own retry contract. |
+| `step(fn, max_attempts=…, backoff=…)` | The same at the pipeline; each option overrides the decorator's. |
+| `step(fn, when=predicate)` | Run only when `predicate(variables)` is true; otherwise the element is `skipped`. |
+
+What a step leaves unset comes from the `Flow`'s `RuntimeConfig`. A bare `@step`
+changes nothing. `step(when=…)` without `fn` raises `BadRequestError`.
+
+### Definitions
+
+| Call | Does |
+|---|---|
+| `await flow.deploy(model, *, namespace="default")` | Deploy a `ProcessModel`, its JSON, or BPMN XML. Returns the existing version if the checksum is unchanged, or else the next one. Raises `BadRequestError` listing every reason it cannot run. |
+| `await flow.definition(key, *, namespace="default", version=None)` | That version, or the latest. Raises `NotFoundError`. |
+
+### Instances
+
+| Call | Does |
+|---|---|
+| `await flow.start(key, *, variables=None, metadata=None, namespace="default", version=None)` | Start an instance and advance it to its first wait within the same transaction. A declared key starts the version this process deployed; any other key starts the latest version, unless `version` pins one. |
+| `await flow.complete_task(instance_id, element_id, payload=None)` | Complete a waiting user task with `payload` as its output. Raises `NotFoundError` if there is no such user task, `ConflictError` if it is not waiting. |
+| `await flow.get(instance_id)` | A `WorkflowInstance`. Raises `NotFoundError`. |
+| `flow.query()` | An `InstanceQuery`. |
+
+## The definition format
+
+A `ProcessModel` is JSON using BPMN's names:
+
+```json
+{
+  "key": "billing.dunning",
+  "elements": [
+    {"id": "start",    "type": "startEvent"},
+    {"id": "remind",   "type": "serviceTask", "taskType": "billing.remind", "retries": 3},
+    {"id": "review",   "type": "userTask", "resultVariable": "review"},
+    {"id": "decide",   "type": "exclusiveGateway", "default": "close"},
+    {"id": "escalate", "type": "callActivity", "calledElement": "billing.escalation"},
+    {"id": "end",      "type": "endEvent"}
+  ],
+  "flows": [
+    {"id": "f1", "source": "start", "target": "remind"},
+    {"id": "f2", "source": "remind", "target": "review"},
+    {"id": "f3", "source": "review", "target": "decide"},
+    {"id": "f4", "source": "decide", "target": "escalate",
+     "condition": {"==": [{"var": "review.decision"}, "escalate"]}},
+    {"id": "close", "source": "decide", "target": "end"},
+    {"id": "f6", "source": "escalate", "target": "end"}
+  ]
+}
 ```
 
-`extract_reducers` reads the first **callable** in each field's `Annotated`
-metadata. Other metadata (a description, a validator) is ignored. A field with no
-reducer is last-write-wins.
+| Element | Does |
+|---|---|
+| `startEvent` | Where an instance begins. Exactly one. |
+| `serviceTask` | A job: the handler for `taskType` runs it on whichever driving `Flow` claims it. `retries` and `backoff` fall back to `RuntimeConfig`. |
+| `userTask` | Waits for `complete_task()`. |
+| `exclusiveGateway` | Takes the first outgoing flow, in declared order, whose condition holds; otherwise its `default`. With neither, the instance fails. |
+| `callActivity` | Starts a child instance of `calledElement` in the same namespace and waits for it. Uses the child's latest version unless `version` pins one. The child's final variables are the element's output, and a failed child fails the parent. |
+| `adHocSubProcess` | A decider picks activities from `elements` each round; see below. |
+| `endEvent` | Completes the instance. At least one. |
 
-`apply_state_update(current, update, reducers)` returns a new dict; `current` is
-not mutated. A reducer is never called against a missing key — the first write
-installs the value — so `operator.add` does not have to cope with `None`.
+Any element may carry `resultVariable`, which nests its output under that name
+instead of merging it. An instance's variables start as its `input`, which never
+changes. A child instance starts with a copy of its parent's variables.
 
-Every path that advances a run's state goes through it. Nothing calls
-`dict.update` on a run state: that silently turns an accumulator into an
-overwrite, and the only symptom is a log that keeps just its final line.
+**Deploy refuses** a model with:
+- an id used twice, or an id containing `/`;
+- a flow to an unknown element;
+- an unreachable element, or a cycle;
+- a non-gateway with other than one outgoing flow;
+- a condition outside a gateway, or a gateway flow with neither a condition nor
+  default status;
+- an operator the condition evaluator lacks.
 
-## Querying
+### Ad-hoc subprocesses
 
-Every filter and terminal is listed in the
-[README](../README.md#8-finding-runs). What it does not say:
+```json
+{"id": "agent", "type": "adHocSubProcess", "taskType": "agent.decide", "maxIterations": 10,
+ "resultVariable": "answer",
+ "elements": [{"id": "search", "type": "serviceTask", "taskType": "tool.search", "resultVariable": "found"}]}
+```
 
-`InstanceQuery` filters mutate and return `self`. Nothing executes until a
-terminal is awaited, so the builder is I/O-free and testable without a database.
+1. The decider (the handler for `taskType`) runs with the variables. Its
+   `ctx.activities` holds the ids it may choose from.
+2. `AdHocDecision(activate=(Activation(element_id="search", variables={...}), ...))`
+   starts one job per activation, in parallel; the same activity may appear
+   more than once. Each job sees the instance's variables with its activation's
+   variables laid over them.
+3. Once every job of the round has finished, the decider runs again with fresh
+   attempts and sees their outputs.
+4. `AdHocDecision(done=True, output={...})`, or activating nothing, completes the
+   element with `output`.
 
-`metadata()` and `state()` accumulate across calls. Every other filter replaces
-its previous value, so `.status("a").status("b")` filters on `"b"` alone.
-`.state(**kv)` matches `run.input` — the state a run *started* with, not its
-current state. Both compile to JSONB containment against a GIN index.
+The instance fails if:
+- a round goes beyond `maxIterations`;
+- an activation names an id outside `elements`;
+- the decider returns something other than an `AdHocDecision`.
 
-**Only `started_at` orders results, and that is deliberate.** Paging is keyset
-over `(started_at, id)`: both NOT NULL, covered by `ix_run_started_at_id` in that
-order, so the boundary compiles to a row comparison Postgres pushes into the
-index as an `Index Cond`. Offering `finished_at` as a sort key would reintroduce
-a nullable column, and a row comparison against NULL evaluates to NULL — dropping
-the row from the page without failing anything.
+An activity's element id is `<subprocess>/<round>.<position>/<activity>`, for
+example `agent/2.0/search`.
 
-`limit(n)` must be positive. `RunSummary.p95_duration_seconds` is the worst
-per-status p95, not a true global one; computing that needs an ungrouped pass,
-which the field name does not suggest.
+### BPMN XML
+
+`parse_bpmn(xml, *, key=None)`, and `flow.deploy(xml)`, compile a BPMN 2.0
+document to a `ProcessModel`. `key` picks the process when the document holds
+more than one.
+
+| Model field | Read from |
+|---|---|
+| `taskType`, `retries` | `zeebe:taskDefinition type="…" retries="…"`, or `flow:taskType` |
+| `calledElement` | `calledElement`, or `zeebe:calledElement processId="…"`; `flow:version` pins a version |
+| `resultVariable`, `maxIterations` | `flow:resultVariable`, `flow:maxIterations` (`xmlns:flow="https://forktex.com/schema/flow"`) |
+| `condition` | `conditionExpression` holding JSON Logic |
+
+Documentation, lanes, annotations and the diagram stay in the source and are
+left out of the model.
+
+`parse_bpmn` refuses, by name:
+- any other element type;
+- a FEEL condition;
+- a document with a DOCTYPE.
+
+The same process deployed as XML and as JSON is one version.
+
+### Conditions
+
+A gateway condition is [JSON Logic](https://jsonlogic.com) over the variables.
+Supported operators:
+- `var` (dotted paths, with an optional default) and `missing`;
+- `==`, `===`, `!=`, `!==`;
+- `<`, `<=`, `>`, `>=` (with three arguments, "between");
+- `and`, `or`, `!`, `!!`, `if`, `in`.
+
+It differs from the JavaScript reference in two ways:
+
+- **Equality is strict.** `"1500"` never equals `1500`, and `true` never equals
+  `1`.
+- **Ordering compares like with like.** Numbers compare with numbers and strings
+  with strings. Any other pair is false, so a variable of the wrong type sends
+  the gateway to its default.
 
 ## `WorkflowInstance`
 
-| Method | Behaviour |
+The fields:
+- **Identity:** `instance_id`, `namespace`, `key`, `version`, `definition_id`.
+- **State:** `status` (`active`, `completed`, `failed`, `cancelled`), `input`,
+  `variables`, `metadata`, `error`, `cancel_reason`, `triggered_by` (`manual`,
+  `schedule`, `call`).
+- **Lineage:** `parent_instance_id`, `parent_element_id`.
+- **Timing:** `started_at`, `finished_at`.
+- **Elements:** `elements`, one `ElementRunInfo` per element visited.
+
+| Call | Returns |
 |---|---|
-| `await refresh()` | A fresh snapshot. Does not mutate the one you hold. |
-| `await wait(timeout=None)` | Blocks until terminal, polling every 0.5s. On timeout returns the snapshot it has — a timeout is not an error, and raising would discard the progress the run made. |
-| `async for s in stream()` | Yields a snapshot whenever the run or any step moves, ending on the terminal one. The terminal snapshot is always emitted. |
-| `await cancel()` | Ask the run to stop; returns whether it was still stoppable. See below. |
+| `await instance.wait(timeout=None)` | The snapshot once terminal, or at the timeout. A timeout is not an error. |
+| `await instance.refresh()` | A fresh snapshot. |
+| `async for s in instance.stream()` | A snapshot per change, ending with the terminal one. |
+| `await instance.cancel(reason=…)` | `True` if it took effect. Cancels active children and stops a running handler at its next heartbeat. `False` if the instance had already finished. |
+| `instance.current_elements` | The elements holding the token: pending or running jobs, waiting tasks and calls. |
+| `instance.element(element_id)` | That element's run, or `None`. |
 
-An instance rebuilt from a wire payload has no database behind it; live methods
-raise `NotFoundError` saying so rather than failing three frames deeper.
+## `InstanceQuery`
 
-## Running it in production
+Filters chain. Repeating a filter replaces it, except `.metadata()` and
+`.variables()`, which accumulate.
 
-How the engine behaves under failure — memoisation and resume, leader election,
-reclaim, the tables it owns, what to watch — is
-[`docs/operating.md`](operating.md). Read it before putting a driver in front of
-real work.
+| Filter | Matches |
+|---|---|
+| `.namespace(name)` | One namespace. |
+| `.key(key, version=None)` | One key, optionally one version. |
+| `.status(*statuses)` / `.triggered_by(*triggers)` | Any of these. |
+| `.metadata(**kv)` / `.variables(**kv)` | JSONB containment. |
+| `.current_element(*element_ids)` | The token is at one of these. |
+| `.children_of(instance_id)` | Children started by call activities. |
+| `.since(dt)` / `.until(dt)` | Started at or after / before. |
+| `.limit(n)` | Page size; default 50. |
 
-## Testing your workflows
+Terminals: `await q.fetch(cursor=None)` returns an `InstancePage` (`items`,
+`has_more`, `next_cursor`), and `q.first()`, `q.count()` and `q.summary()` are awaited the
+same way.
 
-Three helpers.
+## `Ctx`
 
-**A step is an ordinary callable.** `@step` returns the function unchanged, so
-most of what a step does is testable with no database at all:
+| Member | |
+|---|---|
+| `instance_id`, `namespace`, `key`, `version` | The instance and its definition. |
+| `element_id`, `task_type` | The element being run. |
+| `attempt`, `max_attempts`, `final_attempt` | This attempt, counting from 1; whether a failure now fails the instance. |
+| `metadata` | The instance's metadata. |
+| `activities` | For an ad-hoc decider: the ids it may activate. |
+| `await ctx.emit(event_type, payload=None)` | Append to `instance_event`. Raises `BadRequestError` on a `make_ctx()` context. |
+| `await ctx.sleep(seconds)` | Sleep. Not durable: a crash mid-sleep retries the job. |
 
-```python
-from forktex_flow import make_ctx
+## `RuntimeConfig`
 
-async def test_provision_records_the_server():
-    result = await provision(make_ctx(metadata={"org_id": "acme"}), {"logs": []})
-    assert result["server_id"] == "srv-1"
-```
+| Field | Default | Controls |
+|---|---|---|
+| `poll_interval` | `1.0` | Seconds between claims when idle, and between the leader's passes. A process claims again at once after it starts or advances an instance. |
+| `election_interval` | `2.0` | Seconds a non-leader waits before standing again. |
+| `heartbeat_interval` | `10.0` | Seconds between a running job's heartbeats. |
+| `stale_threshold` | `60.0` | Heartbeat silence after which a job is reclaimed. Must exceed `heartbeat_interval`. Also how long a job may sit unclaimed before the leader warns. |
+| `max_attempts` | `3` | Attempts for a task that declares none. |
+| `backoff` | `(30.0, 120.0, 300.0)` | Seconds between attempts. The last entry repeats. |
+| `max_concurrent_jobs` | `10` | Jobs this `Flow` runs at once. |
+| `leader_lock_key` | `0` | The advisory lock key; `0` derives it from the schema. |
+| `drain_timeout` | `25.0` | How long stopping waits for running jobs. |
 
-`make_ctx` is not bound to a database, so `Ctx.emit()` raises rather than
-silently dropping an event a test believed it recorded.
+A setting that cannot work raises `BadRequestError` naming it.
 
-**A whole pipeline needs Postgres.** `isolated_flow` gives one a schema of its
-own and drops it afterwards, so a suite is safe against a single database:
+## `FlowExtension`
 
-```python
-import pytest_asyncio
-from forktex_flow import isolated_flow, run_to_completion
+Any object with one or more of these methods:
 
-@pytest_asyncio.fixture
-async def flow(postgres_url):
-    async with isolated_flow(postgres_url) as f:
-        register_my_workflows(f)
-        yield f
+| Hook | Called | Can |
+|---|---|---|
+| `before_start(key, version, variables, metadata)` | Before an instance is written | Return a dict merged into its metadata. |
+| `after_complete(instance, variables)` | Once `completed` | Observe. |
+| `after_fail(instance, error)` | Once `failed`; `error` is a `WorkflowFailed` | Observe. |
 
-async def test_the_deploy_pipeline(flow):
-    final = await run_to_completion(flow, "deploy.apply", state={"logs": [], "dns_enabled": True})
-    assert final.status == "completed"
-    assert final.state["logs"] == ["provisioned", "dns configured"]
-```
+A terminal hook that raises is logged; the instance's outcome is unaffected.
 
-`run_to_completion` executes inline rather than starting a driver, so a test
-asserts on a result instead of polling a background loop and hoping the tick
-landed. It re-executes a run that scheduled a retry until the run is terminal —
-give such steps `backoff=(0.0,)` or the wait is real — and gives up after
-`max_attempts` passes so a workflow that never settles fails the test instead of
-hanging it.
+## Testing helpers
 
-Needs `pip install "forktex-flow[testing]"` for `testcontainers`, or point
-`isolated_flow` at any Postgres you already have.
-
-## Extensions
-
-```python
-class TenantScope:
-    async def before_start(self, name, version, input, metadata) -> dict: ...
-    async def after_complete(self, run: RunInfo, output) -> None: ...
-    async def after_fail(self, run: RunInfo, error: BaseException) -> None: ...
-```
-
-A `Protocol`, and every method is optional — implement what you need on a plain
-object. `before_start` returns a dict merged into the run's metadata before the
-row is inserted; that metadata reaches every step via `Ctx.metadata` and is
-queryable via `.metadata(**kv)` against a GIN index. Terminal hooks are
-**awaited**; one that raises is logged and swallowed.
-
-Per-run scoping goes in metadata, not in columns. An earlier design let an
-extension declare extra columns on `run`/`step_run`, added by `ALTER TABLE` at
-`init()` — but nothing ever wrote to them and nothing ever read them, so it was
-143 lines of DDL machinery producing columns that stayed NULL. JSONB containment
-on `metadata` does the job with an index behind it and no schema to migrate.
+| Helper | Gives |
+|---|---|
+| `make_ctx(*, namespace, key, version, element_id, attempt, max_attempts, metadata, instance_id, activities)` | A `Ctx` with no database, for awaiting a handler directly. |
+| `isolated_flow(url)` | An async context manager: a migrated `Flow` on a throwaway schema, dropped on exit. |
+| `run_to_completion(flow, key, *, variables=None, namespace="default", …)` | Start an instance and `run_pending` it. |
+| `run_pending(flow, instance_id)` | Run the instance's jobs, and its children's, inline and without backoff, until it is terminal or waits on something else (such as a user task). |
 
 ## Errors
 
-| Class | From | Raised when |
-|---|---|---|
-| `FlowError` | `forktex_flow` | The library itself failed |
-| `StepFailed` | `forktex_flow` | A step body raised past its retries |
-| `WorkflowFailed` | `forktex_flow` | A run reached terminal `failed` |
-| `WorkflowCancelled` | `forktex_flow` | A run was cancelled |
-| `StateNotSerialisable` | `forktex_flow` | State carries a value JSONB cannot take |
-| `FlowClosed` | `forktex_flow` | An entry point was called after `close()` |
-| `NotFoundError` | **`forktex.error`** | Unregistered workflow, or unknown run id |
-| `AlreadyExistsError` | **`forktex.error`** | A `(name, version)` registered twice |
-| `BadRequestError` | **`forktex.error`** | A bad argument — each method's docs say which |
+| Error | Raised when |
+|---|---|
+| `BadRequestError` | A definition, document, cron or config that cannot run. |
+| `NotFoundError` | An undeployed key or version, an unknown instance, or no such user task. |
+| `ConflictError` | Completing a user task that is not waiting. |
+| `AlreadyExistsError` | A key or task type declared twice in one `Flow`. |
+| `StateNotSerialisable` | Variables that JSONB cannot hold: at `start()`, or as a failed attempt. |
+| `FlowClosed` | Any call after `close()`. |
+| `WorkflowCancelled` | Raised by you in a handler, to cancel its instance. |
+| `WorkflowFailed` | Handed to `after_fail`, carrying the instance's error. |
 
-The last three come from the substrate — `from forktex.error import
-AlreadyExistsError, BadRequestError, NotFoundError`.
-
-## Gotchas
-
-- **A version is immutable.** Re-registering `(name, version)` raises. Two
-  declarations disagreeing about what a workflow is means a run resumed after a
-  restart executes whichever module was imported second. Bump the version.
-- **State must be JSON-serialisable.** It is the memoisation key and it
-  round-trips through JSONB. A step needing a session or a client builds one
-  inside its own body from ids carried in state. A value JSONB cannot take
-  raises `StateNotSerialisable` when the key is computed, which is the same run
-  failure the state write would cause a moment later, named.
-- **`Ctx.sleep` is not durable.** A worker dying mid-sleep re-executes the run
-  from the top and the sleep starts over. For a delay that must survive a
-  restart, end the step and let the retry backoff carry the wait.
-- **`stale_threshold` must exceed `heartbeat_interval`.** `RuntimeConfig` rejects
-  the reverse at construction: it reclaims a step that is still running.
-- **Cancellation is not a rollback.** Completed steps stay completed and stay
-  visible.
-- **A step that is not registered in the dispatching process fails its run**
-  rather than hanging, so an unclaimable `running` row cannot accumulate.
-- **Delivery is at-least-once, not exactly-once.** A step body can run twice —
-  a heartbeat that lagged past `stale_threshold` is enough. The memoisation in
-  `step_run` makes a *completed* step skip on replay; it cannot un-send an email
-  a step sent before it crashed. Side effects need their own idempotency key.
-- **`flow.run()` takes no idempotency key.** Calling it twice queues two runs.
-  Deduplicate before dispatch if a caller may retry.
-- **There is no process host.** `start_driver()` runs inside your event loop;
-  nothing daemonises, supervises or restarts it. `stop_driver()` waits up to 30
-  seconds for in-flight runs and then **cancels** whatever is left, mid-step.
-  Those runs stay `running` until a heartbeat goes stale and the next leader
-  reclaims them, so a step whose side effects are not idempotent should finish
-  well inside that window.
-- **A CPU-bound step stalls the engine, not just itself.** Runs execute on the
-  leader's loop, so a step that blocks without awaiting delays every other run
-  on that worker, and the delay is the blocking duration. Push blocking work to
-  a thread or a subprocess.
+`FlowError` is the base of the library's own errors. The first four come from
+`forktex.error`. All derive from `forktex.error.AppError`.

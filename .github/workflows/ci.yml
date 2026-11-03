@@ -52,9 +52,5 @@ jobs:
       - name: Install dependencies
         run: poetry install --with dev
 
-      # `make ci` is the whole gate: parse-check · format-check · lint ·
-      # license-check · typecheck · audit · test · build · smoke. The test step
-      # boots a real Postgres through testcontainers, so it needs the Docker
-      # daemon that ubuntu-latest already provides.
       - name: Run pre-merge gate (make ci)
         run: poetry run make ci

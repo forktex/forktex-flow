@@ -21,9 +21,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Bring the ``forktex_flow`` schema up to date. Forward-only: a bad migration is fixed by the next version, never
-by a downgrade — the same convention DBOS, Loki and Sentry follow.
-"""
+"""Bring the ``forktex_flow`` schema up to date. Forward-only: a bad migration is fixed by the next version."""
 
 from __future__ import annotations
 
@@ -39,10 +37,6 @@ __all__ = ["apply_migrations"]
 
 _MIGRATIONS_DIR = Path(__file__).parent
 
-#: Not the runner's default of ``schema_version``. Deployed databases already
-#: carry this table under this name; the runner has to be told.
-_VERSION_TABLE = "flow_schema_version"
-
 
 async def apply_migrations(engine: AsyncEngine, schema: str = "forktex_flow") -> None:
     """Apply every unapplied migration for ``schema``. Idempotent and safe to call from every worker on startup —
@@ -52,5 +46,4 @@ async def apply_migrations(engine: AsyncEngine, schema: str = "forktex_flow") ->
         engine,
         schema=schema,
         migrations_dir=_MIGRATIONS_DIR,
-        version_table=_VERSION_TABLE,
     ).apply()

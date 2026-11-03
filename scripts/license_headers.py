@@ -47,7 +47,6 @@ HEADER_LINES = [
     "along with this program. If not, see <https://www.gnu.org/licenses/>.",
 ]
 
-# Used to detect ANY version of our header (current or outdated)
 # How far into a file a header may start: 23 header lines, plus room for a
 # shebang and an encoding line.
 HEADER_SEARCH_LINES = 40
@@ -56,8 +55,6 @@ END_MARKER = "along with this program"
 
 # This script contains SENTINEL as data; skip self to avoid false matches
 SELF_PATH = os.path.abspath(__file__)
-# Fallback end markers for older header versions
-ALT_END_MARKERS = ["See the LICENSE and NOTICE files for full terms"]
 
 # Comment styles per extension
 HASH_EXTS = {".py", ".sh", ".yml", ".yaml", ".toml", ".cfg", ".ini", ".conf"}
@@ -100,12 +97,8 @@ def has_current_header(content: str) -> bool:
     """Check if the file has the CURRENT version of the header.
 
     Every non-blank line of ``HEADER_LINES`` must be present, not just the
-    sentinels. Matching on ``SPDX-License-Identifier`` plus ``along with this
-    program`` alone accepted any header whose two ends were right and whose
-    middle was stale: 18 files carried "This file is part of forktex-core", a
-    distribution that no longer exists, and the gate reported them as current
-    all the way into the built wheel. The product name is the line most likely
-    to be wrong after a rename, and it sits exactly between the two sentinels.
+    sentinels: a header whose two ends are right can still name the wrong
+    product in between.
     """
     head = "\n".join(content.split("\n")[:HEADER_SEARCH_LINES])
     return all(line in head for line in HEADER_LINES if line)
@@ -116,7 +109,7 @@ def has_any_header(content: str) -> bool:
     head = "\n".join(content.split("\n")[:HEADER_SEARCH_LINES])
     if SENTINEL not in head:
         return False
-    for marker in [END_MARKER] + ALT_END_MARKERS:
+    for marker in [END_MARKER]:
         if marker in head:
             return True
     return False
@@ -180,7 +173,7 @@ def strip_header(filepath: str) -> bool:
         return False
 
     # Find the end: look for end markers
-    all_markers = [END_MARKER] + ALT_END_MARKERS
+    all_markers = [END_MARKER]
     for i in range(start, min(len(search_lines), start + 40)):
         line = search_lines[i]
         if any(m in line for m in all_markers):

@@ -79,8 +79,7 @@ def test_an_untyped_state_has_no_reducers():
 
 
 def test_unresolvable_annotations_fall_back_to_last_write_wins():
-    """A state class whose hints cannot be resolved must degrade to overwrite,
-    not raise — failing closed here would take down every run using it."""
+    """A state class whose hints cannot be resolved merges by overwrite rather than raising."""
 
     class Broken(TypedDict):
         field: "SomeTypeThatDoesNotExist"  # noqa: F821
@@ -89,10 +88,7 @@ def test_unresolvable_annotations_fall_back_to_last_write_wins():
 
 
 def test_a_reducer_survives_an_unresolvable_sibling_annotation() -> None:
-    """`get_type_hints` raises for the whole class when one name is only
-    imported under TYPE_CHECKING — the house style everywhere — so the fallback
-    read raw string annotations, matched no `Annotated`, and silently turned
-    every accumulator into last-write-wins."""
+    """Annotations that name a type imported only under ``TYPE_CHECKING`` still yield their reducers."""
     from tests.test_domain import _deferred_state
 
     reducers = extract_reducers(_deferred_state.DeferredState)

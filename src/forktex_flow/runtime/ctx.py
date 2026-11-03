@@ -32,7 +32,7 @@ from forktex.error import BadRequestError
 from forktex.types import JsonObject
 from pydantic import BaseModel, PrivateAttr
 
-from forktex_flow.persist import runs as _runs
+from forktex_flow.persist import instances as _instances
 
 if TYPE_CHECKING:
     from forktex_flow.persist.store import FlowStore
@@ -41,32 +41,31 @@ __all__ = ["Ctx"]
 
 
 class Ctx(BaseModel):
-    run_id: UUID
-    workflow_name: str
-    workflow_version: int
-    node_name: str
+    instance_id: UUID
+    namespace: str
+    key: str
+    version: int
+    element_id: str
+    task_type: str
     attempt: int
+    max_attempts: int
     metadata: JsonObject
+    #: For an ad-hoc decider: the ids of the activities it may activate.
+    activities: tuple[str, ...] = ()
 
     _store: FlowStore | None = PrivateAttr(default=None)
-    """Set by the executor. ``None`` on a ``Ctx`` a test constructed directly,
-    which is why :meth:`emit` checks it — a step under unit test should be able
-    to take a bare ``Ctx`` without a database."""
 
-    def __init__(self, _store: FlowStore | None = None, **data: object) -> None:
-        """Accept ``_store`` positionally: pydantic's generated ``__init__`` only takes declared public fields."""
-        super().__init__(**data)
-        if _store is not None:
-            self._store = _store
+    @property
+    def final_attempt(self) -> bool:
+        return self.attempt >= self.max_attempts
 
     async def emit(self, event_type: str, payload: JsonObject | None = None) -> None:
+        """Raises ``BadRequestError`` on a ``Ctx`` built without a database, such as ``make_ctx()``'s."""
         if self._store is None:
             raise BadRequestError("Ctx.emit() needs a database-bound Ctx; this one was constructed without a store")
-        await _runs.emit_run_event(self._store, self.run_id, event_type, payload or {})
+        async with self._store.transaction() as session:
+            _instances.emit(session, self.instance_id, event_type, payload)
 
     async def sleep(self, seconds: float) -> None:
-        """Wait, in process. Not durable: if the worker dies mid-sleep the run is re-executed from the top,
-        completed steps are served from their cached outputs, and this sleep starts over. For a delay that must
-        survive a restart, end the step and let the retry backoff carry the wait.
-        """
+        """Not durable: a worker that dies mid-sleep leaves the job to be retried, and the sleep starts over."""
         await asyncio.sleep(seconds)

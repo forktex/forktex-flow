@@ -10,43 +10,38 @@ not open a public issue for an unfixed vulnerability.
 | Version | Supported |
 | --- | --- |
 | 1.0.x | ✅ |
-| 0.8.x and earlier | ❌ — a different package (the agentic CLI); see [CHANGELOG](CHANGELOG.md) |
 
 ## Scope
 
-`forktex` is a library. It has no CLI, no daemon, no network listener, and no ambient
-filesystem access — it runs entirely inside the consuming service's process, under that
-service's privileges. The security-relevant surface is therefore narrow:
+`forktex-flow` is a library. It has no CLI, no daemon and no network listener; it runs
+inside the consuming service's process, under that service's privileges, and talks only
+to the Postgres database you give it. The security-relevant surface:
 
-- **`vault`** — Fernet symmetric encryption at rest and the `EncryptedJSON` column type.
-- **`database`** — SQL construction. Everything is SQLAlchemy Core/ORM; no module in
-  this library builds a SQL string by interpolation. Identifiers that reach DDL are
-  validated (`database.identifiers`) and quoted by the dialect's preparer.
-- **`storage` / `store` / `vector` / `cache` / `queue`** — clients for external
-  infrastructure. Credentials are supplied by the caller and never persisted by the
-  library.
-- **`log`** — structured output. It does not redact; see below.
+- **SQL.** Every statement is a SQLAlchemy construct; nothing builds SQL by
+  interpolating a value. The schema name is the only identifier that reaches DDL.
+- **Definitions as data.** `flow.deploy()` accepts JSON and BPMN XML that may come
+  from a tenant. Gateway conditions are JSON Logic, evaluated by a closed set of
+  operators — no code execution. BPMN XML with a DOCTYPE is refused, which closes
+  entity expansion, and the parser never fetches external resources.
+- **Handlers are yours.** A definition can only name task types; it runs code only
+  through the handlers your process registered.
 
 ## What this library does not do
 
-- **No phone-home.** Nothing here contacts a ForkTex service. The only network traffic
-  is to the infrastructure *you* configure (your Postgres, your Redis, your S3).
-- **No credential storage.** Connection strings and keys are passed in by the consumer
-  and held in memory for the process lifetime only.
-- **No authentication or authorization.** These are the consuming service's concern.
+- **No authorization.** Who may deploy a definition, start an instance or complete a
+  user task is the consuming service's decision.
+- **No secret storage.** Variables and metadata are stored as plain JSONB. Do not put
+  credentials in them; carry an id and resolve the secret inside the handler.
+- **No phone-home.** The only network traffic is to the database you configure.
 
 ## Operator responsibilities
 
-- **`vault` key management.** The KEK is derived with a single SHA-256 over the value
-  you supply, which is *not* a password-stretching KDF. Supply a high-entropy key
-  (e.g. 32 random bytes), not a passphrase. Length alone is not sufficient.
-- **Log redaction.** `log` emits the fields you give it. It does not scan for secrets;
-  do not pass credentials, tokens, or personal data into log context.
-- **Transport security.** Use TLS-enabled connection URLs for every backing service.
-  The library does not downgrade or override your transport settings.
-- **Dependency currency.** Optional extras pull real clients (`cryptography`,
-  `aioboto3`, `qdrant-client`, `pymongo`, `arq`). `make audit` runs `pip-audit` against
-  the resolved environment and is part of `make ci`.
+- **Namespaces are not a security boundary on their own.** They keep definitions and
+  instances apart, but every query a consumer exposes must filter by the caller's
+  namespace.
+- **Transport security.** Use a TLS-enabled database URL.
+- **Dependency currency.** `make audit` runs `pip-audit` against the resolved
+  environment and is part of `make ci`.
 
 ## Licensing
 

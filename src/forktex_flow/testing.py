@@ -28,38 +28,49 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import sqlalchemy as sa
 from forktex.types import JsonObject
 from sqlalchemy import text
 
 from forktex_flow.domain.config import RuntimeConfig
+from forktex_flow.domain.types import DEFAULT_NAMESPACE
 from forktex_flow.extension import FlowExtension
 from forktex_flow.flow import Flow
+from forktex_flow.persist import jobs as _jobs
+from forktex_flow.persist.models import Instance
 from forktex_flow.read.instance import WorkflowInstance
 from forktex_flow.runtime.ctx import Ctx
-from forktex_flow.runtime.execution import execute_run
+from forktex_flow.runtime.worker import run_job
 
-__all__ = ["isolated_flow", "make_ctx", "run_to_completion"]
+__all__ = ["isolated_flow", "make_ctx", "run_pending", "run_to_completion"]
 
 
 def make_ctx(
     *,
-    workflow_name: str = "test",
-    workflow_version: int = 1,
-    node_name: str = "step",
+    namespace: str = DEFAULT_NAMESPACE,
+    key: str = "test",
+    version: int = 1,
+    element_id: str = "step",
     attempt: int = 1,
+    max_attempts: int = 3,
     metadata: JsonObject | None = None,
-    run_id: uuid.UUID | None = None,
+    instance_id: uuid.UUID | None = None,
+    activities: tuple[str, ...] = (),
 ) -> Ctx:
-    """A ``Ctx`` for awaiting a step directly:: Not bound to a database, so ``Ctx.emit()`` raises: a step whose
-    logic you are testing should not need one, and a step that does belongs in :func:`run_to_completion`.
+    """A ``Ctx`` for awaiting a handler directly. ``emit()`` raises on it: a handler that needs the database
+    belongs in :func:`run_to_completion`.
     """
     return Ctx(
-        run_id=run_id or uuid.uuid7(),
-        workflow_name=workflow_name,
-        workflow_version=workflow_version,
-        node_name=node_name,
+        instance_id=instance_id or uuid.uuid7(),
+        namespace=namespace,
+        key=key,
+        version=version,
+        element_id=element_id,
+        task_type=f"{key}:{element_id}",
         attempt=attempt,
+        max_attempts=max_attempts,
         metadata=metadata or {},
+        activities=activities,
     )
 
 
@@ -83,20 +94,37 @@ async def isolated_flow(
 
 async def run_to_completion(
     flow: Flow,
-    name: str,
+    key: str,
     *,
-    state: JsonObject | None = None,
+    variables: JsonObject | None = None,
     metadata: JsonObject | None = None,
+    namespace: str = DEFAULT_NAMESPACE,
     version: int | None = None,
-    max_attempts: int = 10,
 ) -> WorkflowInstance:
-    instance = await flow.run(name, state=state, metadata=metadata, version=version)
-    runtime = flow._execution_context()
+    instance = await flow.start(key, variables=variables, metadata=metadata, namespace=namespace, version=version)
+    return await run_pending(flow, instance.instance_id)
 
-    for _ in range(max_attempts):
-        await execute_run(runtime, instance.instance_id, name, instance.workflow_version)
-        current = await flow.get(instance.instance_id)
-        if current.status != "pending":
-            return current
 
-    return await flow.get(instance.instance_id)
+async def run_pending(flow: Flow, instance_id: uuid.UUID, *, max_jobs: int = 1000) -> WorkflowInstance:
+    """Run the instance's jobs, and its children's, in this task. A retry does not wait for its backoff. Returns
+    once the instance is terminal or waits on something this Flow cannot do, such as a user task.
+    """
+    runtime = flow._runtime
+    for _ in range(max_jobs):
+        tree = await _tree(flow, instance_id)
+        jobs = await _jobs.claim(flow._store, runtime.registry.task_types(), 1, instance_ids=tree, ignore_backoff=True)
+        if not jobs:
+            break
+        await run_job(runtime, jobs[0])
+    return await flow.get(instance_id)
+
+
+async def _tree(flow: Flow, root: uuid.UUID) -> list[uuid.UUID]:
+    found, frontier = [root], [root]
+    async with flow.transaction() as session:
+        while frontier:
+            frontier = list(
+                await session.scalars(sa.select(Instance.id).where(Instance.parent_instance_id.in_(frontier)))
+            )
+            found.extend(frontier)
+    return found

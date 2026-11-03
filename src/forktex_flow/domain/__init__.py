@@ -21,46 +21,65 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Flow's vocabulary: frozen value objects and the declarative workflow shapes."""
+"""Flow's vocabulary: the process model, its conditions, and the value objects the engine reads and writes."""
 
-from forktex_flow.domain.definition import (
-    NodeDef,
-    NodeFn,
-    WhenFn,
-    WorkflowDefinition,
-)
-from forktex_flow.domain.node import (
-    StepMeta,
-    StepSpec,
-    has_step_meta,
-    step,
-    step_meta,
+from forktex_flow.domain.config import RuntimeConfig
+from forktex_flow.domain.node import HandlerFn, StepMeta, StepSpec, WhenFn, step, step_meta
+from forktex_flow.domain.process import (
+    Activation,
+    AdHocDecision,
+    AdHocSubProcess,
+    CallActivity,
+    Element,
+    EndEvent,
+    ExclusiveGateway,
+    ProcessModel,
+    SequenceFlow,
+    ServiceTask,
+    StartEvent,
+    UserTask,
 )
 from forktex_flow.domain.state import ReducerFn, apply_state_update, extract_reducers
 from forktex_flow.domain.types import (
+    DEFAULT_NAMESPACE,
     TERMINAL_STATUSES,
-    RunInfo,
-    RunStatus,
-    StepRunInfo,
-    StepStatus,
+    DefinitionInfo,
+    ElementRunInfo,
+    ElementStatus,
+    InstanceInfo,
+    InstanceStatus,
+    InstanceSummary,
 )
 
 __all__ = [
+    "DEFAULT_NAMESPACE",
     "TERMINAL_STATUSES",
-    "NodeDef",
-    "NodeFn",
+    "Activation",
+    "AdHocDecision",
+    "AdHocSubProcess",
+    "CallActivity",
+    "DefinitionInfo",
+    "Element",
+    "ElementRunInfo",
+    "ElementStatus",
+    "EndEvent",
+    "ExclusiveGateway",
+    "HandlerFn",
+    "InstanceInfo",
+    "InstanceStatus",
+    "InstanceSummary",
+    "ProcessModel",
     "ReducerFn",
-    "RunInfo",
-    "RunStatus",
+    "RuntimeConfig",
+    "SequenceFlow",
+    "ServiceTask",
+    "StartEvent",
     "StepMeta",
-    "StepRunInfo",
     "StepSpec",
-    "StepStatus",
+    "UserTask",
     "WhenFn",
-    "WorkflowDefinition",
     "apply_state_update",
     "extract_reducers",
-    "has_step_meta",
     "step",
     "step_meta",
 ]
