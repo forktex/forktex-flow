@@ -25,25 +25,37 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Self
 
+import sqlalchemy as sa
+from forktex import iso
 from forktex.database import Database, advisory_key
-from forktex.error import BadRequestError, NotFoundError
+from forktex.error import BadRequestError, ConflictError, NotFoundError
 from forktex.log import get_logger
 from forktex.types import JsonObject
+from pydantic import BaseModel
 
+from forktex_flow.domain.bpmn import parse_bpmn
 from forktex_flow.domain.config import RuntimeConfig
+from forktex_flow.domain.node import HandlerFn, StepSpec, check_handler
+from forktex_flow.domain.process import PRIVATE_SEPARATOR, ProcessModel
+from forktex_flow.domain.state import check_variables
+from forktex_flow.domain.types import DEFAULT_NAMESPACE, DefinitionInfo
 from forktex_flow.errors import FlowClosed
-from forktex_flow.persist import runs as _runs
+from forktex_flow.persist import definitions as _definitions
+from forktex_flow.persist import instances as _instances
 from forktex_flow.persist.migrations import apply_migrations
+from forktex_flow.persist.models import ElementRun
 from forktex_flow.persist.store import FlowStore
 from forktex_flow.read.instance import InstanceQuery, WorkflowInstance, bind_instance
-from forktex_flow.runtime.compiler import compile_pipeline, compile_scheduled
+from forktex_flow.runtime.compiler import compile_pipeline
 from forktex_flow.runtime.context import FlowRuntime
 from forktex_flow.runtime.driver import Driver
-from forktex_flow.runtime.registry import FlowRegistry
+from forktex_flow.runtime.engine import Advance, notify
+from forktex_flow.runtime.registry import FlowRegistry, Handler
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -56,19 +68,17 @@ __all__ = ["Flow"]
 
 logger = get_logger(__name__)
 
-#: The schema literal the ORM models are declared against. Not configurable —
-#: `schema_translate_map` rewrites it per instance at execution time, which is
-#: what lets two Flows run against different schemas in one process without
-#: forking the model definitions.
+#: The schema literal the ORM models are declared against; `schema_translate_map` rewrites it per instance.
 _MODEL_SCHEMA = "forktex_flow"
 
-#: ``leader_lock_key`` left at this value means "derive it from the schema".
-#: `advisory_key` never returns 0, so a derived key cannot collide with it.
+#: ``leader_lock_key`` left at this value means "derive it from the schema"; `advisory_key` never returns 0.
 _DERIVE_LEADER_LOCK_KEY = 0
 
 
 class Flow:
-    """Durable workflow runtime. Its ``schema_translate_map`` must remap ``forktex_flow`` to ``schema``."""
+    """Durable workflow runtime. A supplied ``database``'s ``schema_translate_map`` must remap ``forktex_flow`` to
+    ``schema``. With ``drive=True``, ``async with`` also starts the driver.
+    """
 
     def __init__(
         self,
@@ -78,12 +88,12 @@ class Flow:
         schema: str = _MODEL_SCHEMA,
         extensions: list[FlowExtension] | None = None,
         config: RuntimeConfig | None = None,
+        drive: bool = False,
         echo: bool = False,
         **engine_kwargs: object,
     ) -> None:
         if (database_url is None) == (database is None):
             raise BadRequestError("pass exactly one of database_url or database")
-
         if database is not None:
             if database.schema_translate_map != {_MODEL_SCHEMA: schema}:
                 logger.warning(
@@ -91,13 +101,10 @@ class Flow:
                     "will resolve to whatever its map says",
                     _MODEL_SCHEMA,
                     schema,
-                    extra={"schema": schema, "map": database.schema_translate_map},
                 )
             self._db = database
             self._owns_db = False
         else:
-            # `Database` owns connection management. Construction is lazy:
-            # nothing connects until something executes.
             self._db = Database(
                 database_url,  # type: ignore[arg-type]  # guarded above
                 echo=echo,
@@ -107,17 +114,18 @@ class Flow:
             self._owns_db = True
 
         self.extensions: tuple[FlowExtension, ...] = tuple(extensions or ())
+        self.drive = drive
         self._closed = False
         self._driver_lock = asyncio.Lock()
-        self._store = FlowStore(database=self._db, schema=schema)
-        self._registry = FlowRegistry()
+        self._deploy_lock = asyncio.Lock()
         self._config = _with_lock_key(config or RuntimeConfig(), schema)
+        self._store = FlowStore(database=self._db, schema=schema, leader_lock_key=self._config.leader_lock_key)
+        self._registry = FlowRegistry()
         self._runtime = FlowRuntime(
-            store=self._store,
-            registry=self._registry,
-            config=self._config,
-            extensions=self.extensions,
+            store=self._store, registry=self._registry, config=self._config, extensions=self.extensions
         )
+        #: key → the version this process deployed for each code-declared workflow.
+        self._deployed: dict[str, DefinitionInfo] = {}
         self._driver: Driver | None = None
         self._driver_task: asyncio.Task[None] | None = None
 
@@ -132,17 +140,18 @@ class Flow:
         return self._store.engine
 
     def transaction(self) -> AbstractAsyncContextManager[AsyncSession]:
-        """A read transaction on this Flow's pool. The engine owns the boundary: ``commit()`` raises
+        """One transaction on this Flow's pool. The block owns the boundary: ``commit()`` raises
         ``TransactionBoundaryError``.
         """
         return self._store.transaction()
 
     async def init(self) -> None:
-        """Bring the schema up to date. Idempotent, and safe to call from every worker: concurrent callers
-        serialise on an advisory lock.
+        """Bring the schema up to date and deploy every code-declared workflow. Idempotent and safe from every
+        worker at once: migrations and deploys serialise on advisory locks.
         """
         self._refuse_if_closed()
         await apply_migrations(self.engine, self.schema)
+        await self._deploy_declared()
 
     async def verify(self) -> None:
         """Probe the pool, creating nothing. Raises ``DatabaseUnreachableError``."""
@@ -156,24 +165,16 @@ class Flow:
                 return
             await self.init()
             self._driver = Driver(self._runtime)
-            self._driver_task = asyncio.create_task(
-                self._driver.run(),
-                name=f"forktex_flow.driver[{self.schema}]",
-            )
+            self._driver_task = asyncio.create_task(self._driver.run(), name=f"forktex_flow.driver[{self.schema}]")
 
     async def stop_driver(self) -> None:
-        """Stop the driver loop cleanly. Idempotent."""
+        """Stop claiming, wait up to ``drain_timeout`` for running jobs, and hand the rest back. Idempotent."""
         if self._driver is not None:
             self._driver.shutdown.set()
         if self._driver_task is not None:
-            self._driver_task.cancel()
             try:
                 await self._driver_task
-            except asyncio.CancelledError:
-                pass  # expected — we just cancelled it
             except Exception:
-                # The task died with a real error instead of cancelling. Log it;
-                # stop_driver still completes so shutdown is not blocked.
                 logger.warning("driver task raised during shutdown", exc_info=True)
             self._driver_task = None
             self._driver = None
@@ -184,117 +185,184 @@ class Flow:
         if self._owns_db:
             await self._db.dispose()
 
-    def _refuse_if_closed(self) -> None:
-        """Guard the entry points that touch the pool. Disposing the pool does not invalidate the handle, so a call
-        after ``close()`` either raises from deep inside the driver or quietly opens a fresh connection — which
-        leaks a pool nothing will dispose.
-        """
-        if self._closed:
-            raise FlowClosed("this Flow is closed; construct a new one")
+    async def __aenter__(self) -> Self:
+        await self.init()
+        if self.drive:
+            await self.start_driver()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
 
     # ── Declaration ──────────────────────────────────────────────────────
 
-    def scheduled(
-        self,
-        name: str,
-        *,
-        version: int,
-        cron: str,
-        state: type | None = None,
-        enabled: bool = True,
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def handler(self, task_type: str, *, state: type[BaseModel] | None = None) -> Callable[[HandlerFn], HandlerFn]:
+        """Run the decorated ``async def name(ctx, state)`` for every service task (or ad-hoc decider) of
+        ``task_type`` this Flow claims, in any namespace. With ``state``, it receives the variables as that model.
+        Raises ``BadRequestError`` for another function shape or a task type containing ``:``, and
+        ``AlreadyExistsError`` for a type it already handles.
+        """
+        if not task_type or PRIVATE_SEPARATOR in task_type:
+            raise BadRequestError(f"task type {task_type!r} must be non-empty; ':' is reserved for pipeline steps")
 
-        def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._registry.register(
-                compile_scheduled(
-                    fn,
-                    name=name,
-                    version=version,
-                    cron=cron,
-                    state_cls=state,
-                    enabled=enabled,
-                    defaults=self._config,
-                )
-            )
+        def _decorator(fn: HandlerFn) -> HandlerFn:
+            check_handler(fn)
+            self._registry.handle(Handler(task_type=task_type, fn=fn, state=state))
             return fn
 
         return _decorator
 
     def pipeline(
         self,
-        name: str,
+        key: str,
         *,
-        version: int,
+        steps: Sequence[StepSpec | HandlerFn | str],
         state: type | None = None,
         cron: str | None = None,
-    ) -> Callable[[type], type]:
-
-        def _decorator(cls: type) -> type:
-            self._registry.register(
-                compile_pipeline(cls, name=name, version=version, cron=cron, state_cls=state, defaults=self._config)
-            )
-            return cls
-
-        return _decorator
+        enabled: bool = True,
+    ) -> None:
+        """Declare start → each step → end, deployed into ``DEFAULT_NAMESPACE``. A step is a function, a shared
+        handler's task type, or ``step(...)`` of either. ``state`` is a pydantic model (validated at ``start()``,
+        handed to each step) or a ``TypedDict``; either may annotate reducers. ``cron`` schedules it, and
+        ``enabled=False`` declares that schedule disarmed. Raises ``BadRequestError`` or ``AlreadyExistsError``
+        naming what cannot be declared.
+        """
+        self._registry.declare(*compile_pipeline(key, steps, state=state, cron=cron, enabled=enabled))
 
     def registered(self) -> list[str]:
-        return self._registry.names()
+        return self._registry.keys()
 
-    # ── Dispatch and read ────────────────────────────────────────────────
+    # ── Definitions ──────────────────────────────────────────────────────
 
-    async def run(
+    async def deploy(
+        self, model: ProcessModel | JsonObject | str, *, namespace: str = DEFAULT_NAMESPACE
+    ) -> DefinitionInfo:
+        """The version holding this model — a ``ProcessModel``, its JSON, or BPMN 2.0 XML: a new one when it
+        changed, the existing one when it did not. Raises ``BadRequestError`` naming everything that stops it
+        from running. XML is kept verbatim as the version's source.
+        """
+        self._refuse_if_closed()
+        if isinstance(model, str):
+            parsed, source = parse_bpmn(model), model
+        else:
+            parsed = model if isinstance(model, ProcessModel) else ProcessModel.model_validate(model)
+            source = json.dumps(model if isinstance(model, dict) else parsed.model_dump(mode="json", exclude_none=True))
+        async with self._store.transaction() as session:
+            definition, _created = await _definitions.deploy(
+                session, parsed, schema=self.schema, namespace=namespace, source=source
+            )
+        return definition
+
+    async def definition(
+        self, key: str, *, namespace: str = DEFAULT_NAMESPACE, version: int | None = None
+    ) -> DefinitionInfo:
+        """That version, or the latest. Raises ``NotFoundError``."""
+        self._refuse_if_closed()
+        async with self._store.transaction() as session:
+            found = await _definitions.find(session, namespace, key, version)
+        if found is None:
+            raise NotFoundError(f"workflow {key!r} is not deployed in namespace {namespace!r}")
+        return found
+
+    # ── Instances ────────────────────────────────────────────────────────
+
+    async def start(
         self,
-        name: str,
+        key: str,
         *,
-        state: JsonObject | None = None,
+        variables: JsonObject | None = None,
         metadata: JsonObject | None = None,
+        namespace: str = DEFAULT_NAMESPACE,
         version: int | None = None,
     ) -> WorkflowInstance:
+        """Start an instance and advance it to its first wait. A code-declared workflow starts the version this
+        process deployed; any other the latest, unless ``version`` pins one. Raises ``NotFoundError``.
+        """
         self._refuse_if_closed()
-        defn = self._registry.get(name, version=version)
-        if defn is None:
-            raise NotFoundError(f"workflow {name!r} is not registered in this process")
+        await self._deploy_declared()
+        definition = self._deployed.get(key) if namespace == DEFAULT_NAMESPACE and version is None else None
+        if definition is None:
+            definition = await self.definition(key, namespace=namespace, version=version)
 
-        run_input = dict(state or {})
-        run_metadata = dict(metadata or {})
-
+        start_variables = self._registry.initial(key, dict(variables or {}))
+        check_variables(start_variables)
+        start_metadata = dict(metadata or {})
         for extension in self.extensions:
             hook = getattr(extension, "before_start", None)
-            if hook is None:
-                continue
-            extra = await hook(name, defn.version, run_input, run_metadata)
-            if extra:
-                run_metadata.update(extra)
+            if hook is not None:
+                start_metadata.update(await hook(key, definition.version, start_variables, start_metadata) or {})
 
-        run_id = await _runs.insert_run(
-            self._store,
-            workflow_name=name,
-            workflow_version=defn.version,
-            input=run_input,
-            metadata=run_metadata,
-        )
-        return await self.get(run_id)
+        async with self._store.transaction() as session:
+            advance = Advance(self._runtime, session)
+            instance_id = await advance.start(definition, variables=start_variables, metadata=start_metadata)
+        await notify(self._runtime, advance.finished)
+        return await self.get(instance_id)
 
-    async def get(self, run_id: UUID) -> WorkflowInstance:
-        """The run with this id. Raises ``NotFoundError`` when it does not exist."""
+    async def complete_task(
+        self, instance_id: UUID, element_id: str, payload: JsonObject | None = None
+    ) -> WorkflowInstance:
+        """Complete a waiting user task with ``payload`` as its output, and advance the instance. Raises
+        ``NotFoundError`` for no such task, ``ConflictError`` when it is not waiting.
+        """
         self._refuse_if_closed()
-        info = await _runs.fetch_run(self._store, run_id)
+        output = dict(payload or {})
+        check_variables(output)
+        async with self._store.transaction() as session:
+            run = await session.scalar(
+                sa.select(ElementRun).where(
+                    ElementRun.instance_id == instance_id,
+                    ElementRun.element_id == element_id,
+                    ElementRun.element_type == "userTask",
+                )
+            )
+            if run is None:
+                raise NotFoundError(f"instance {instance_id} has no user task {element_id!r}")
+            advance = Advance(self._runtime, session)
+            if not await advance.complete(run.id, output, expected="waiting"):
+                raise ConflictError(f"user task {element_id!r} of instance {instance_id} is not waiting")
+        await notify(self._runtime, advance.finished)
+        return await self.get(instance_id)
+
+    async def get(self, instance_id: UUID) -> WorkflowInstance:
+        """Raises ``NotFoundError`` when it does not exist."""
+        self._refuse_if_closed()
+        info = await _instances.fetch(self._store, instance_id)
         if info is None:
-            raise NotFoundError(f"run {run_id} not found")
+            raise NotFoundError(f"instance {instance_id} not found")
         return bind_instance(info, self._store)
 
     def query(self) -> InstanceQuery:
         return InstanceQuery(self._store)
 
-    def _execution_context(self) -> FlowRuntime:
-        return self._runtime
+    # ── Internals ────────────────────────────────────────────────────────
+
+    async def _deploy_declared(self) -> None:
+        pending = [key for key in self._registry.definitions if key not in self._deployed]
+        if not pending:
+            return
+        async with self._deploy_lock, self._store.transaction() as session:
+            now = iso.now()
+            for key in pending:
+                declared = self._registry.definitions[key]
+                source = json.dumps(declared.model.model_dump(mode="json", exclude_none=True))
+                definition, _created = await _definitions.deploy(
+                    session, declared.model, schema=self.schema, namespace=DEFAULT_NAMESPACE, source=source
+                )
+                if declared.cron is not None:
+                    await _definitions.upsert_schedule(
+                        session, DEFAULT_NAMESPACE, key, cron=declared.cron, enabled=declared.enabled, now=now
+                    )
+                self._deployed[key] = definition
+
+    def _refuse_if_closed(self) -> None:
+        """Disposing the pool does not invalidate the handle, so a call after ``close()`` would otherwise open a
+        fresh pool nothing disposes.
+        """
+        if self._closed:
+            raise FlowClosed("this Flow is closed; construct a new one")
 
 
 def _with_lock_key(config: RuntimeConfig, schema: str) -> RuntimeConfig:
-    """Give the driver a lock key derived from *this* instance's schema. Leader election is one advisory lock, so
-    two ``Flow``s sharing a key share a leader: whichever wins drives and the other idles, with its schedules
-    never firing.
-    """
     if config.leader_lock_key != _DERIVE_LEADER_LOCK_KEY:
         return config
     return config.model_copy(update={"leader_lock_key": advisory_key(schema, "driver")})

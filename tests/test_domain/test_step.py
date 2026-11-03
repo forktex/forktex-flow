@@ -21,81 +21,110 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""`step` is dual-mode, which is the sort of API that goes wrong quietly."""
-
 from __future__ import annotations
 
+import functools
+
 import pytest
-from forktex.error import BadRequestError
+from forktex.error import AlreadyExistsError, BadRequestError
 
-from forktex_flow import StepSpec, step
-from forktex_flow.domain.node import StepMeta, has_step_meta, step_meta
+from forktex_flow import Ctx, Flow, ServiceTask, step
 
 
-async def _body(ctx: object, state: dict) -> dict:
+async def ship(ctx: Ctx, state: dict) -> dict:
     return {}
 
 
-def test_bare_decorator_returns_the_function_unchanged():
-    """A step stays an ordinary callable, so a unit test can await it directly
-    without a Flow, a database, or a run."""
-
-    @step
-    async def decorated(ctx: object, state: dict) -> dict:
-        return {"ok": True}
-
-    assert has_step_meta(decorated)
-    assert step_meta(decorated) == StepMeta(max_attempts=3, backoff=(30.0, 120.0, 300.0))
+async def _task(flow: Flow, entry: object, element_id: str = "ship") -> ServiceTask:
+    flow.pipeline("p", steps=[entry])
+    await flow.init()
+    task = (await flow.definition("p")).model.element(element_id)
+    assert isinstance(task, ServiceTask)
+    return task
 
 
-def test_decorator_with_options_attaches_them():
-    @step(max_attempts=5, backoff=(1.0, 2.0))
-    async def decorated(ctx: object, state: dict) -> dict:
-        return {}
-
-    meta = step_meta(decorated)
-    assert meta is not None
-    assert (meta.max_attempts, meta.backoff) == (5, (1.0, 2.0))
+@pytest.mark.asyncio
+async def test_a_plain_step_leaves_retries_to_the_config(flow: Flow):
+    task = await _task(flow, ship)
+    assert (task.task_type, task.retries, task.backoff) == ("p:ship", None, None)
 
 
-def test_a_positional_call_with_a_guard_returns_a_spec_not_a_function():
-    """The two modes are told apart by whether `fn` was passed positionally.
-    Getting this wrong silently would put a bare function where a guard was
-    intended, and the guard would never run."""
-    spec = step(_body, when=lambda s: True)
-    assert isinstance(spec, StepSpec)
-    assert spec.fn is _body
-    assert spec.when is not None
+@pytest.mark.asyncio
+async def test_a_steps_retry_options_are_part_of_its_definition(flow: Flow):
+    task = await _task(flow, step(ship, max_attempts=5, backoff=(1.0, 9.0)))
+    assert (task.retries, task.backoff) == (5, (1.0, 9.0))
 
 
-def test_a_positional_call_with_retry_options_returns_a_spec():
-    spec = step(_body, max_attempts=9)
-    assert isinstance(spec, StepSpec)
-    assert spec.max_attempts == 9
-    assert spec.when is None
+@pytest.mark.asyncio
+async def test_a_shared_handler_is_a_step_by_its_task_type(flow: Flow):
+    task = await _task(flow, "payments.charge", element_id="payments.charge")
+    assert task.task_type == "payments.charge"
 
 
-def test_a_guard_without_a_function_is_rejected():
-    """`when` selects a step *within a pipeline*, so it is meaningless without
-    the function it guards. Silently ignoring it would ship a pipeline whose
-    conditional steps all run unconditionally."""
-    with pytest.raises(BadRequestError, match="requires fn as a positional argument"):
-        step(when=lambda s: True)
+@pytest.mark.asyncio
+async def test_a_name_gives_the_same_function_a_second_step(flow: Flow):
+    flow.pipeline("p", steps=[ship, step(ship, name="ship_again")])
+    await flow.init()
+    model = (await flow.definition("p")).model
+    assert [e.id for e in model.elements] == ["start", "ship", "ship_again", "end"]
 
 
-def test_an_undecorated_callable_carries_no_meta():
-    """`None` here is a legitimate answer, not a broken invariant — the compilers
-    accept bare callables and fall back to the defaults."""
-    assert step_meta(_body) is None
-    assert has_step_meta(_body) is False
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda ctx, state: {},
+        functools.partial(lambda: {}),
+    ],
+    ids=["sync", "no-params"],
+)
+def test_a_step_that_is_not_async_def_ctx_state_is_refused(fn: object):
+    with pytest.raises(BadRequestError):
+        step(fn)  # type: ignore[arg-type]
 
 
-def test_step_meta_ignores_a_foreign_attribute():
-    """Defensive: the marker attribute is read back with a type check, so an
-    unrelated object parked on the same name is not mistaken for retry config."""
+@pytest.mark.parametrize("signature", ["(state)", "(ctx, state, extra)", "(ctx, *, state)"])
+def test_a_handler_with_another_shape_is_refused(flow: Flow, signature: str):
+    namespace: dict = {}
+    exec(f"async def handle{signature}: return {{}}", namespace)
+    with pytest.raises(BadRequestError, match=r"must take exactly \(ctx, state\)"):
+        flow.handler("payments.charge")(namespace["handle"])
 
-    async def impostor(ctx: object, state: dict) -> dict:
-        return {}
 
-    impostor.__forktex_step_meta__ = "not a StepMeta"  # type: ignore[attr-defined]
-    assert step_meta(impostor) is None
+def test_two_steps_with_one_name_are_refused(flow: Flow):
+    with pytest.raises(AlreadyExistsError, match="give one a name="):
+        flow.pipeline("p", steps=[ship, ship])
+
+
+def test_start_and_end_are_reserved_step_names(flow: Flow):
+    with pytest.raises(BadRequestError, match="reserved"):
+        flow.pipeline("p", steps=[step(ship, name="end")])
+
+
+def test_a_function_without_a_usable_name_needs_one(flow: Flow):
+    nameless = functools.partial(ship)
+    with pytest.raises(BadRequestError, match="pass name="):
+        step(nameless)
+    flow.pipeline("p", steps=[step(nameless, name="ship")])
+
+
+def test_a_condition_is_json_logic():
+    with pytest.raises(BadRequestError, match="JSON Logic"):
+        step(ship, when=lambda state: True)  # type: ignore[arg-type]
+
+
+def test_a_condition_the_evaluator_lacks_is_refused(flow: Flow):
+    with pytest.raises(BadRequestError, match="cannot run"):
+        flow.pipeline("p", steps=[step(ship, when={"regex": ["x", "y"]})])
+
+
+@pytest.mark.parametrize("task_type", ["orders:ship", ""])
+def test_a_private_or_empty_task_type_is_refused(flow: Flow, task_type: str):
+    with pytest.raises(BadRequestError):
+        flow.handler(task_type)
+    with pytest.raises(BadRequestError):
+        step(task_type)
+
+
+def test_a_pipeline_needs_steps(flow: Flow):
+    with pytest.raises(BadRequestError, match="no steps"):
+        flow.pipeline("p", steps=[])

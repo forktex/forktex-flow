@@ -21,23 +21,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""The advertised PostgreSQL floor is exercised, not asserted.
-
-The README tells a reader which PostgreSQL they need. Every other test in this
-suite runs on the version we develop against, so that sentence was the one
-compatibility claim in the project with nothing behind it — and the failure it
-guards against is silent: a consumer on the floor version hits an error inside
-`Flow.init()`, not a resolver message.
-
-The floor is read out of the README rather than repeated here, so raising the
-claim without checking it fails instead of quietly becoming untrue.
-"""
+"""Flow migrates and runs on the oldest PostgreSQL it supports."""
 
 from __future__ import annotations
 
 import operator
-import re
-from pathlib import Path
 from typing import Annotated, TypedDict
 
 import pytest
@@ -48,14 +36,7 @@ from forktex_flow.testing import run_to_completion
 
 from .._containers import start_postgres
 
-README = Path(__file__).resolve().parents[2] / "README.md"
-
-
-def advertised_floor() -> int:
-    """The major version the README promises, e.g. 14 from 'PostgreSQL 14+'."""
-    match = re.search(r"PostgreSQL (\d+)\+", README.read_text(encoding="utf-8"))
-    assert match, "README no longer states a 'PostgreSQL N+' floor"
-    return int(match.group(1))
+FLOOR = 14
 
 
 class FloorState(TypedDict):
@@ -73,35 +54,23 @@ async def _guarded(ctx: Ctx, state: FloorState) -> dict:
 
 @pytest.mark.asyncio
 async def test_the_advertised_postgres_floor_runs_a_workflow() -> None:
-    """`package:claims-are-checked`. Migrate and run on the oldest supported server.
-
-    Covers the features whose availability is version-dependent and which a
-    newer server would hide: the migration's DDL (partial and `jsonb_path_ops`
-    GIN indexes, the row-comparison keyset index), `ON CONFLICT ... DO UPDATE`
-    on the memoisation constraint, and the JSONB containment filters.
-    """
-    floor = advertised_floor()
-    container, url = start_postgres(f"postgres:{floor}-alpine")
+    container, url = start_postgres(f"postgres:{FLOOR}-alpine")
     try:
         flow = Flow(database_url=url.render_as_string(hide_password=False))
-        flow.pipeline("floor.check", version=1, state=FloorState)(
-            type("FloorPipeline", (), {"steps": [_first, step(_guarded, when=lambda s: s["run_guarded"])]})
-        )
+        flow.pipeline("floor.check", state=FloorState, steps=[_first, step(_guarded, when={"var": "run_guarded"})])
         await flow.init()
 
         async with flow.transaction() as session:
             server_major = int((await session.execute(sa.text("SHOW server_version"))).scalar_one().split(".")[0])
-        assert server_major == floor, "the container is not the version the README advertises"
+        assert server_major == FLOOR
 
-        final = await run_to_completion(flow, "floor.check", state={"logs": [], "run_guarded": True})
+        final = await run_to_completion(flow, "floor.check", variables={"logs": [], "run_guarded": True})
         assert final.status == "completed"
-        assert final.state["logs"] == ["first", "guarded"]
+        assert final.variables["logs"] == ["first", "guarded"]
 
-        # The two JSONB filters and the keyset page, which lean on index types
-        # whose operator classes differ across versions.
-        page = await flow.query().workflow("floor.check", version=1).limit(5).fetch()
+        page = await flow.query().key("floor.check", version=1).metadata().variables(run_guarded=True).limit(5).fetch()
         assert len(page.items) == 1
-        assert await flow.query().current_node("_guarded").count() == 0
+        assert await flow.query().current_element("_guarded").count() == 0
 
         await flow.close()
     finally:

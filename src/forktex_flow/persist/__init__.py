@@ -21,21 +21,20 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Flow's persistence layer: the ORM tables and one module per aggregate. `models` declares the tables on
-`substrate_base("forktex_flow")` — its own `MetaData`, so a consumer's `BaseDBModel.metadata.create_all()` never
-tries to build this library's schema.
+"""Flow's persistence: the ORM tables and one module per aggregate. The tables live on their own `MetaData`, so a
+consumer's `BaseDBModel.metadata.create_all()` never tries to build this library's schema.
 """
 
 from forktex_flow.persist.migrations import apply_migrations
-from forktex_flow.persist.models import Run, RunEvent, ScheduledRun, StepRun, Workflow
+from forktex_flow.persist.models import Definition, ElementRun, Instance, InstanceEvent, Schedule
 from forktex_flow.persist.store import FlowStore
 
 __all__ = [
+    "Definition",
+    "ElementRun",
     "FlowStore",
-    "Run",
-    "RunEvent",
-    "ScheduledRun",
-    "StepRun",
-    "Workflow",
+    "Instance",
+    "InstanceEvent",
+    "Schedule",
     "apply_migrations",
 ]

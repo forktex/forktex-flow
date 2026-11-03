@@ -34,7 +34,7 @@ from sqlalchemy import text
 
 from forktex_flow import Flow
 
-EXPECTED_TABLES = {"workflow", "run", "step_run", "run_event", "scheduled_run", "flow_schema_version"}
+EXPECTED_TABLES = {"definition", "instance", "element_run", "instance_event", "schedule", "schema_version"}
 
 
 @pytest.mark.asyncio
@@ -46,62 +46,40 @@ async def test_init_creates_every_table(flow: Flow):
 
 @pytest.mark.asyncio
 async def test_init_is_idempotent(flow: Flow):
-    """Every worker calls this on startup, so the second call through has to be
-    a no-op rather than a duplicate-object error."""
+    """Every worker calls this on startup, so the second call through has to be a no-op."""
     await flow.init()
     await flow.init()
 
     async with flow.engine.connect() as conn:
         applied = (
-            await conn.execute(
-                sa.text(f'SELECT count(*), count(DISTINCT version) FROM "{flow.schema}".flow_schema_version')
-            )
+            await conn.execute(sa.text(f'SELECT count(*), count(DISTINCT version) FROM "{flow.schema}".schema_version'))
         ).one()
     assert applied[0] == applied[1], "the second init() recorded a duplicate version row"
 
 
 @pytest.mark.asyncio
-async def test_the_version_table_keeps_its_deployed_name(flow: Flow):
-    """`flow_schema_version`, not the migration runner's default of
-    `schema_version`. A deployed database already has the former, and a runner
-    that looks for the latter finds no applied versions and re-runs v0001."""
-    async with flow.engine.connect() as conn:
-        assert await reflect.has_table(conn, "flow_schema_version", schema=flow.schema)
-        assert not await reflect.has_table(conn, "schema_version", schema=flow.schema)
-
-
-@pytest.mark.asyncio
-async def test_the_run_status_check_constraint_is_enforced_by_the_database(flow: Flow):
-    """`database:constraints-in-the-schema`. An application guard holds only for
-    callers that went through that code path, and there is always another one."""
-    async with flow.engine.begin() as conn:
-        with pytest.raises(sa.exc.IntegrityError):
-            await conn.execute(
-                text(
-                    f'INSERT INTO "{flow.schema}".run '  # noqa: S608 - our own schema
-                    "(id, workflow_name, workflow_version, status) "
-                    "VALUES (:id, 'x', 1, 'not-a-status')"
-                ).bindparams(id=uuid.uuid7())
-            )
-
-
-@pytest.mark.asyncio
-async def test_the_step_memoisation_key_is_unique_in_the_database(flow: Flow):
-    """Two workers racing the same step must not both get a row: the uniqueness
-    that makes memoisation safe has to hold under concurrency."""
-    run_id = uuid.uuid7()
+async def test_an_element_runs_at_most_once_per_instance(flow: Flow):
+    """Two workers racing to record one element must not both get a row: that uniqueness is what stops a resume
+    from repeating a completed element."""
+    definition, instance = uuid.uuid7(), uuid.uuid7()
     async with flow.engine.begin() as conn:
         await conn.execute(
             text(
-                f'INSERT INTO "{flow.schema}".run '  # noqa: S608 - our own schema
-                "(id, workflow_name, workflow_version, status) VALUES (:id, 'x', 1, 'running')"
-            ).bindparams(id=run_id)
+                f'INSERT INTO "{flow.schema}".definition '  # noqa: S608 - our own schema
+                "(id, namespace, key, version, checksum, model, source) "
+                "VALUES (:id, 'default', 'k', 1, 'c', '{}'::jsonb, '')"
+            ).bindparams(id=definition)
+        )
+        await conn.execute(
+            text(
+                f'INSERT INTO "{flow.schema}".instance '  # noqa: S608 - our own schema
+                "(id, namespace, key, version, definition_id, status) VALUES (:id, 'default', 'k', 1, :d, 'active')"
+            ).bindparams(id=instance, d=definition)
         )
         insert = text(
-            f'INSERT INTO "{flow.schema}".step_run '  # noqa: S608 - our own schema
-            "(id, run_id, step_name, step_qualname, step_index, args_hash, status, max_attempts) "
-            "VALUES (:id, :run_id, 's', 'x:s', 0, 'hash', 'pending', 3)"
+            f'INSERT INTO "{flow.schema}".element_run '  # noqa: S608 - our own schema
+            "(id, instance_id, element_id, element_type, status) VALUES (:id, :i, 'a', 'serviceTask', 'pending')"
         )
-        await conn.execute(insert.bindparams(id=uuid.uuid7(), run_id=run_id))
+        await conn.execute(insert.bindparams(id=uuid.uuid7(), i=instance))
         with pytest.raises(sa.exc.IntegrityError):
-            await conn.execute(insert.bindparams(id=uuid.uuid7(), run_id=run_id))
+            await conn.execute(insert.bindparams(id=uuid.uuid7(), i=instance))

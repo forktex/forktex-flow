@@ -12,6 +12,7 @@ Usage:
     python scripts/license_headers.py fix      # add or update headers everywhere
     python scripts/license_headers.py strip     # remove headers from all files
 """
+
 import os
 import re
 import sys
@@ -47,7 +48,6 @@ HEADER_LINES = [
     "along with this program. If not, see <https://www.gnu.org/licenses/>.",
 ]
 
-# Used to detect ANY version of our header (current or outdated)
 # How far into a file a header may start: 23 header lines, plus room for a
 # shebang and an encoding line.
 HEADER_SEARCH_LINES = 40
@@ -56,8 +56,6 @@ END_MARKER = "along with this program"
 
 # This script contains SENTINEL as data; skip self to avoid false matches
 SELF_PATH = os.path.abspath(__file__)
-# Fallback end markers for older header versions
-ALT_END_MARKERS = ["See the LICENSE and NOTICE files for full terms"]
 
 # Comment styles per extension
 HASH_EXTS = {".py", ".sh", ".yml", ".yaml", ".toml", ".cfg", ".ini", ".conf"}
@@ -68,14 +66,25 @@ HTML_EXTS = {".html"}
 SOURCE_EXTS = HASH_EXTS | SLASH_EXTS | CSS_EXTS | HTML_EXTS
 
 SKIP_DIRS = {
-    "node_modules", ".venv", "__pycache__", ".expo", ".git",
-    "api_client", ".next", "dist", "build", ".mypy_cache",
-    "redis-data", "network-db-data", "minio-data",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    ".expo",
+    ".git",
+    "api_client",
+    ".next",
+    "dist",
+    "build",
+    ".mypy_cache",
+    "redis-data",
+    "network-db-data",
+    "minio-data",
     ".forktex",
 }
 
 
 # ── Header formatting ───────────────────────────────────────────────────────
+
 
 def _comment_lines(prefix: str) -> list[str]:
     return [f"{prefix} {line}" if line else prefix for line in HEADER_LINES]
@@ -100,12 +109,8 @@ def has_current_header(content: str) -> bool:
     """Check if the file has the CURRENT version of the header.
 
     Every non-blank line of ``HEADER_LINES`` must be present, not just the
-    sentinels. Matching on ``SPDX-License-Identifier`` plus ``along with this
-    program`` alone accepted any header whose two ends were right and whose
-    middle was stale: 18 files carried "This file is part of forktex-core", a
-    distribution that no longer exists, and the gate reported them as current
-    all the way into the built wheel. The product name is the line most likely
-    to be wrong after a rename, and it sits exactly between the two sentinels.
+    sentinels: a header whose two ends are right can still name the wrong
+    product in between.
     """
     head = "\n".join(content.split("\n")[:HEADER_SEARCH_LINES])
     return all(line in head for line in HEADER_LINES if line)
@@ -116,7 +121,7 @@ def has_any_header(content: str) -> bool:
     head = "\n".join(content.split("\n")[:HEADER_SEARCH_LINES])
     if SENTINEL not in head:
         return False
-    for marker in [END_MARKER] + ALT_END_MARKERS:
+    for marker in [END_MARKER]:
         if marker in head:
             return True
     return False
@@ -124,12 +129,13 @@ def has_any_header(content: str) -> bool:
 
 # ── Strip logic ──────────────────────────────────────────────────────────────
 
+
 def strip_header(filepath: str) -> bool:
     """Remove the license header from a file. Returns True if modified."""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
-    except (UnicodeDecodeError, PermissionError):
+    except UnicodeDecodeError, PermissionError:
         return False
 
     if not has_any_header(content):
@@ -180,7 +186,7 @@ def strip_header(filepath: str) -> bool:
         return False
 
     # Find the end: look for end markers
-    all_markers = [END_MARKER] + ALT_END_MARKERS
+    all_markers = [END_MARKER]
     for i in range(start, min(len(search_lines), start + 40)):
         line = search_lines[i]
         if any(m in line for m in all_markers):
@@ -202,7 +208,7 @@ def strip_header(filepath: str) -> bool:
 
     # Reconstruct
     before = search_lines[:start]
-    after = search_lines[end + 1:]
+    after = search_lines[end + 1 :]
 
     # Clean leading blank lines from 'before'
     while before and before[0].strip() == "":
@@ -226,13 +232,14 @@ def strip_header(filepath: str) -> bool:
 
 # ── Add logic ────────────────────────────────────────────────────────────────
 
+
 def add_header(filepath: str) -> bool:
     """Add the license header to a file. Returns True if modified."""
     ext = os.path.splitext(filepath)[1]
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
-    except (UnicodeDecodeError, PermissionError):
+    except UnicodeDecodeError, PermissionError:
         return False
 
     if has_current_header(content):
@@ -257,6 +264,7 @@ def add_header(filepath: str) -> bool:
 
 # ── File collection ──────────────────────────────────────────────────────────
 
+
 def collect_files(root: str) -> list[str]:
     """Walk the tree and collect all source files to process."""
     result = []
@@ -271,6 +279,7 @@ def collect_files(root: str) -> list[str]:
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
+
 
 def main():
     commands = ("check", "fix", "strip")
@@ -301,7 +310,7 @@ def main():
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     content = f.read()
-            except (UnicodeDecodeError, PermissionError):
+            except UnicodeDecodeError, PermissionError:
                 continue
 
             changed = False
@@ -331,7 +340,7 @@ def main():
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     content = f.read()
-            except (UnicodeDecodeError, PermissionError):
+            except UnicodeDecodeError, PermissionError:
                 continue
             if has_current_header(content):
                 continue

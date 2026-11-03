@@ -1,11 +1,9 @@
-ForkTex Python
+ForkTex Flow
 Copyright (C) 2026 FORKTEX S.R.L.
 
-ForkTex Python is the unified command-line interface and agent runtime for
-the ForkTex self-managed software factory. It bundles the local developer
-agent, FSD (ForkTex Standard for Delivery) compliance tooling, architecture
-discovery and audit, the menu-driven root loop, and orchestration glue
-across the cloud, intelligence, and network services.
+ForkTex Flow is a Postgres-native durable workflow engine: BPMN-aligned process
+definitions, pipelines and schedules, executed at least once by the processes
+that register handlers for them.
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published by

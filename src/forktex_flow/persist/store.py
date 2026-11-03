@@ -36,9 +36,6 @@ __all__ = ["FlowStore", "rowcount"]
 
 
 def rowcount(result: object) -> int:
-    """How many rows an UPDATE touched. Every backend this library targets supports ``rowcount`` on an UPDATE, but
-    pyright's stub does not expose it on the base ``Result`` type, so the access needs a typed fallback.
-    """
     return getattr(result, "rowcount", 0) or 0
 
 
@@ -46,11 +43,12 @@ def rowcount(result: object) -> int:
 class FlowStore:
     database: Database
     schema: str
+    #: The driver's advisory-lock key, so a reader can tell whether any driver is running.
+    leader_lock_key: int = 0
 
     def transaction(self) -> AbstractAsyncContextManager[AsyncSession]:
-        """One transaction per block: commits on clean exit, rolls back on error. Callers do not commit —
-        the block owns the boundary and raises ``TransactionBoundaryError`` on
-        ``commit``/``rollback``/``begin``, so a write-without-commit cannot be introduced.
+        """One transaction per block: commits on clean exit, rolls back on error; ``commit()`` inside it raises
+        ``TransactionBoundaryError``.
         """
         return self.database.transaction()
 

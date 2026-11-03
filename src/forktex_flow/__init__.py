@@ -23,56 +23,73 @@
 
 """Postgres-native durable workflow execution, built on the ``forktex`` substrate."""
 
+from forktex_flow.domain.bpmn import parse_bpmn
 from forktex_flow.domain.config import RuntimeConfig
 from forktex_flow.domain.node import StepSpec, step
+from forktex_flow.domain.process import (
+    Activation,
+    AdHocDecision,
+    AdHocSubProcess,
+    CallActivity,
+    EndEvent,
+    ExclusiveGateway,
+    ProcessModel,
+    SequenceFlow,
+    ServiceTask,
+    StartEvent,
+    UserTask,
+)
 from forktex_flow.domain.state import apply_state_update, extract_reducers
 from forktex_flow.domain.types import (
+    DEFAULT_NAMESPACE,
     TERMINAL_STATUSES,
-    RunInfo,
-    RunStatus,
-    RunSummary,
-    StepRunInfo,
-    StepStatus,
+    DefinitionInfo,
+    ElementRunInfo,
+    ElementStatus,
+    InstanceEventInfo,
+    InstanceInfo,
+    InstanceStatus,
+    InstanceSummary,
 )
-from forktex_flow.errors import (
-    FlowClosed,
-    FlowError,
-    StateNotSerialisable,
-    StepFailed,
-    WorkflowCancelled,
-    WorkflowFailed,
-)
+from forktex_flow.errors import FlowClosed, FlowError, StateNotSerialisable, WorkflowCancelled, WorkflowFailed
 from forktex_flow.extension import FlowExtension
 from forktex_flow.flow import Flow
 from forktex_flow.persist.migrations import apply_migrations
-from forktex_flow.read.instance import (
-    InstancePage,
-    InstanceQuery,
-    NodeInstance,
-    WorkflowInstance,
-)
+from forktex_flow.read.instance import InstancePage, InstanceQuery, WorkflowInstance
 from forktex_flow.runtime.ctx import Ctx
-from forktex_flow.testing import isolated_flow, make_ctx, run_to_completion
+from forktex_flow.testing import isolated_flow, make_ctx, run_pending, run_to_completion
 
 __all__ = [
+    "DEFAULT_NAMESPACE",
     "TERMINAL_STATUSES",
+    "Activation",
+    "AdHocDecision",
+    "AdHocSubProcess",
+    "CallActivity",
     "Ctx",
+    "DefinitionInfo",
+    "ElementRunInfo",
+    "ElementStatus",
+    "EndEvent",
+    "ExclusiveGateway",
     "Flow",
     "FlowClosed",
     "FlowError",
     "FlowExtension",
+    "InstanceEventInfo",
+    "InstanceInfo",
     "InstancePage",
     "InstanceQuery",
-    "NodeInstance",
-    "RunInfo",
-    "RunStatus",
-    "RunSummary",
+    "InstanceStatus",
+    "InstanceSummary",
+    "ProcessModel",
     "RuntimeConfig",
+    "SequenceFlow",
+    "ServiceTask",
+    "StartEvent",
     "StateNotSerialisable",
-    "StepFailed",
-    "StepRunInfo",
     "StepSpec",
-    "StepStatus",
+    "UserTask",
     "WorkflowCancelled",
     "WorkflowFailed",
     "WorkflowInstance",
@@ -81,6 +98,8 @@ __all__ = [
     "extract_reducers",
     "isolated_flow",
     "make_ctx",
+    "parse_bpmn",
+    "run_pending",
     "run_to_completion",
     "step",
 ]

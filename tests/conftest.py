@@ -21,13 +21,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Session-scoped Postgres, per-test schema.
-
-One container for the whole run — pulling and booting Postgres per test file
-would dominate the suite's wall clock. Isolation is at the schema level instead:
-each test gets its own `forktex_flow_<uuid7>` schema, brought up by the real
-migration runner, so nothing is mocked and nothing is shared.
-"""
+"""One Postgres container per session; each test gets a migrated schema of its own."""
 
 from __future__ import annotations
 
@@ -39,14 +33,11 @@ import operator
 from typing import Annotated, TypedDict
 
 import pytest
-from forktex_flow import RuntimeConfig
-from forktex_flow.runtime.context import FlowRuntime
-from forktex_flow.runtime.driver import Driver
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.engine import URL
 
-from forktex_flow import Flow
+from forktex_flow import Flow, RuntimeConfig
 from tests._containers import start_postgres
 
 
@@ -64,11 +55,7 @@ def postgres_url_str(postgres_url: URL) -> str:
 
 @pytest_asyncio.fixture
 async def flow(postgres_url_str: str) -> AsyncIterator[Flow]:
-    """A migrated `Flow` on a schema of its own, torn down after the test.
-
-    The driver is NOT started: a test that wants one starts it explicitly, so
-    nothing races a background loop it did not ask for.
-    """
+    """A migrated `Flow` on a schema of its own, not driving, dropped after the test."""
     schema = "forktex_flow_" + uuid.uuid7().hex
     instance = Flow(postgres_url_str, schema=schema)
     await instance.init()
@@ -81,11 +68,7 @@ async def flow(postgres_url_str: str) -> AsyncIterator[Flow]:
 
 
 async def until(predicate: Callable[[], bool], *, timeout: float = 10.0, interval: float = 0.02) -> None:
-    """Wait for a condition instead of sleeping a guessed interval.
-
-    A fixed sleep either slows every run or, on a loaded container, lets the
-    test proceed before the thing it is about to assert on has happened.
-    """
+    """Wait for a condition instead of sleeping a guessed interval."""
     deadline = asyncio.get_running_loop().time() + timeout
     while not predicate():
         if asyncio.get_running_loop().time() >= deadline:
@@ -99,10 +82,23 @@ class LoggingState(TypedDict, total=False):
     logs: Annotated[list[str], operator.add]
 
 
-def runtime_for(flow: Flow, config: RuntimeConfig | None = None) -> FlowRuntime:
-    """The runtime the driver would build, without starting the driver."""
-    return FlowRuntime(flow._store, flow._registry, config or flow._config, flow.extensions)
+#: Short enough that a test watching the driver finishes in well under a second.
+FAST = RuntimeConfig(
+    poll_interval=0.02,
+    election_interval=0.02,
+    heartbeat_interval=0.05,
+    stale_threshold=0.3,
+    backoff=(0.05,),
+    drain_timeout=2.0,
+)
 
 
-def driver_for(flow: Flow, config: RuntimeConfig | None = None) -> Driver:
-    return Driver(runtime_for(flow, config))
+@pytest_asyncio.fixture
+async def schema(postgres_url_str: str) -> AsyncIterator[str]:
+    """A schema name for tests that build several `Flow`s over one database, dropped afterwards."""
+    name = "forktex_flow_" + uuid.uuid7().hex
+    yield name
+    probe = Flow(postgres_url_str, schema=name)
+    async with probe.engine.begin() as conn:
+        await conn.execute(text(f'DROP SCHEMA IF EXISTS "{name}" CASCADE'))
+    await probe.close()

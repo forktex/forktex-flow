@@ -25,8 +25,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-ForkTex-Commercial
 
-"""A state class in the house style: deferred annotations plus a name that only
-exists for the type checker. `extract_reducers` must still find the reducer."""
+"""A state class with deferred annotations and a name imported only for the type checker."""
 
 from __future__ import annotations
 

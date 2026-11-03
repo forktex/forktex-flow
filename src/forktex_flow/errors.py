@@ -21,9 +21,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Exception hierarchy for ``forktex_flow``. Two are internal control flow rather than reportable failures, and are
-kept out of ``__all__``: a reader looking for "what can this package raise" still finds all of it in one file.
-"""
+"""Everything ``forktex_flow`` raises."""
 
 from __future__ import annotations
 
@@ -36,47 +34,34 @@ class FlowError(AppError):
     code = AppErrorCode.INTERNAL
 
 
-class StepFailed(FlowError):
-    """A step's body raised an exception that exhausted its retries."""
-
-    code = AppErrorCode.FAILED
-
-
 class WorkflowFailed(FlowError):
-    """A run reached terminal ``failed``. Surfaced from ``WorkflowInstance.wait()``."""
+    """An instance reached ``failed``; ``after_fail`` hooks receive it, carrying the instance's error."""
 
     code = AppErrorCode.FAILED
 
 
 class WorkflowCancelled(FlowError):
+    """Raised by a handler to cancel its instance, with the message as the cancel reason."""
+
     code = AppErrorCode.CANCELLED
 
 
-class StepClaimLost(FlowError):
-    """A worker tried to advance a step row it no longer owns. Internal."""
-
-    code = AppErrorCode.CONFLICT
-
-
 class FlowClosed(FlowError):
+    """A call reached a ``Flow`` after ``close()``."""
+
     code = AppErrorCode.FAILED
 
 
 class StateNotSerialisable(FlowError):
-    """A state value cannot be written to JSONB."""
+    """Variables that JSONB cannot hold."""
 
     code = AppErrorCode.VALIDATION
 
 
-class StepRetryRequested(FlowError):
-    """A step body failed with retries remaining. Control flow, internal."""
-
-    code = AppErrorCode.FAILED
-
-
 __all__ = [
+    "FlowClosed",
     "FlowError",
-    "StepFailed",
+    "StateNotSerialisable",
     "WorkflowCancelled",
     "WorkflowFailed",
 ]

@@ -24,120 +24,98 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import Any
 
-from forktex.error import BadRequestError
+from croniter import croniter
+from forktex.error import AlreadyExistsError, BadRequestError
+from pydantic import BaseModel
 
-from forktex_flow.domain.config import RuntimeConfig
-from forktex_flow.domain.definition import NodeDef, NodeFn, WhenFn, WorkflowDefinition
-from forktex_flow.domain.node import StepMeta, StepSpec, step_meta
-from forktex_flow.domain.state import ReducerFn, extract_reducers
+from forktex_flow.domain.node import StepSpec, step
+from forktex_flow.domain.process import (
+    PRIVATE_SEPARATOR,
+    Element,
+    EndEvent,
+    ExclusiveGateway,
+    ProcessModel,
+    SequenceFlow,
+    ServiceTask,
+    StartEvent,
+)
+from forktex_flow.domain.state import extract_reducers, validate_state
+from forktex_flow.runtime.registry import CodeDefinition, Handler
 
-__all__ = ["compile_pipeline", "compile_scheduled"]
+__all__ = ["compile_pipeline"]
 
-
-def compile_scheduled(
-    fn: NodeFn,
-    *,
-    name: str,
-    version: int,
-    cron: str,
-    state_cls: type | None = None,
-    enabled: bool = True,
-    defaults: RuntimeConfig | None = None,
-) -> WorkflowDefinition:
-    resolved = defaults or RuntimeConfig()
-    max_attempts, backoff = _retry(step_meta(fn), resolved)
-    return WorkflowDefinition(
-        name=name,
-        version=version,
-        state_cls=state_cls,
-        nodes=(
-            NodeDef(
-                name=getattr(fn, "__name__", "run"),
-                fn=fn,
-                max_attempts=max_attempts,
-                backoff=backoff,
-            ),
-        ),
-        reducers=extract_reducers(state_cls),
-        schedule=cron,
-        enabled=enabled,
-    )
+_START, _END = "start", "end"
 
 
 def compile_pipeline(
-    cls: type,
+    key: str,
+    steps: Sequence[StepSpec | Callable[..., Any] | str],
     *,
-    name: str,
-    version: int,
+    state: type | None = None,
     cron: str | None = None,
-    state_cls: type | None = None,
-    defaults: RuntimeConfig | None = None,
-) -> WorkflowDefinition:
-    steps: list[Any] = list(getattr(cls, "steps", []))
-    if not steps:
-        raise BadRequestError(f"pipeline {name!r} v{version}: class {cls.__name__} declares no steps")
+    enabled: bool = True,
+) -> tuple[CodeDefinition, list[Handler]]:
+    """start → each step in order → end. A step with ``when`` sits behind a gateway whose default skips it."""
+    specs = [entry if isinstance(entry, StepSpec) else step(entry) for entry in steps]
+    if not specs:
+        raise BadRequestError(f"pipeline {key!r} has no steps")
+    if PRIVATE_SEPARATOR in key:
+        raise BadRequestError(f"pipeline key {key!r} cannot contain {PRIVATE_SEPARATOR!r}")
+    if cron is not None and not croniter.is_valid(cron):
+        raise BadRequestError(f"pipeline {key!r}: {cron!r} is not a valid cron expression")
+    model_state = state if isinstance(state, type) and issubclass(state, BaseModel) else None
+    if cron is not None and model_state is not None:
+        try:
+            validate_state(model_state, {})
+        except BadRequestError as exc:
+            raise BadRequestError(
+                f"pipeline {key!r} is scheduled, so it starts with no variables, which its state refuses: {exc.message}"
+            ) from exc
 
-    resolved = defaults or RuntimeConfig()
-    nodes: list[NodeDef] = []
-    used: dict[str, int] = {}
-    for index, item in enumerate(steps):
-        fn, meta, when_fn = _resolve_step(item, resolved)
-        max_attempts, backoff = _retry(meta, resolved)
+    elements: list[Element] = [StartEvent(id=_START)]
+    flows: list[SequenceFlow] = []
+    handlers: list[Handler] = []
+    used = {_START, _END}
+    #: Where the token can arrive from at the next element, and the flow id that must carry it, if fixed.
+    sources: list[tuple[str, str | None]] = [(_START, None)]
 
-        # The step name identifies its row in `step_run`, so the same function
-        # used twice in one pipeline needs two names. Suffix by position rather
-        # than by an occurrence counter: the position is stable when the list is
-        # edited elsewhere, so a resumed run still matches its recorded rows.
-        node_name = getattr(fn, "__name__", f"step_{index}")
-        if node_name in used:
-            node_name = f"{node_name}_{index}"
-        used[node_name] = index
+    def claim(element_id: str) -> None:
+        if element_id in (_START, _END):
+            raise BadRequestError(f"pipeline {key!r}: {element_id!r} is reserved; give the step another name=")
+        if element_id in used:
+            raise AlreadyExistsError(f"pipeline {key!r} has two steps named {element_id!r}; give one a name=")
+        used.add(element_id)
 
-        nodes.append(
-            NodeDef(
-                name=node_name,
-                fn=fn,
-                max_attempts=max_attempts,
-                backoff=backoff,
-                when_fn=when_fn,
+    def enter(target: str) -> None:
+        for source, flow_id in sources:
+            flows.append(SequenceFlow(id=flow_id or f"{source}->{target}", source=source, target=target))
+
+    for spec in specs:
+        claim(spec.name)
+        task_type = spec.target if isinstance(spec.target, str) else f"{key}{PRIVATE_SEPARATOR}{spec.name}"
+        if spec.when is not None:
+            gateway = f"{spec.name}.when"
+            claim(gateway)
+            enter(gateway)
+            elements.append(ExclusiveGateway(id=gateway, default=f"{gateway}.default"))
+            flows.append(
+                SequenceFlow(id=f"{gateway}->{spec.name}", source=gateway, target=spec.name, condition=spec.when)
             )
-        )
+            sources = [(spec.name, None), (gateway, f"{gateway}.default")]
+        else:
+            enter(spec.name)
+            sources = [(spec.name, None)]
+        elements.append(ServiceTask(id=spec.name, task_type=task_type, retries=spec.max_attempts, backoff=spec.backoff))
+        if not isinstance(spec.target, str):
+            handlers.append(Handler(task_type=task_type, fn=spec.target, state=model_state))
+    enter(_END)
+    elements.append(EndEvent(id=_END))
 
-    effective_state_cls = state_cls if state_cls is not None else getattr(cls, "state_cls", None)
-    reducers: dict[str, ReducerFn] = extract_reducers(effective_state_cls)
-
-    return WorkflowDefinition(
-        name=name,
-        version=version,
-        state_cls=effective_state_cls,
-        nodes=tuple(nodes),
-        reducers=reducers,
-        schedule=cron,
+    model = ProcessModel(key=key, elements=tuple(elements), flows=tuple(flows))
+    definition = CodeDefinition(
+        model=model, reducers=extract_reducers(state), state=model_state, cron=cron, enabled=enabled
     )
-
-
-def _resolve_step(item: NodeFn | StepSpec, defaults: RuntimeConfig) -> tuple[NodeFn, StepMeta | None, WhenFn | None]:
-    if not isinstance(item, StepSpec):
-        return item, step_meta(item), None
-
-    meta = step_meta(item.fn)
-    if item.max_attempts is not None or item.backoff is not None:
-        # Values given to `step(...)` at the call site beat the decorator's:
-        # the pipeline is the more specific context.
-        meta = StepMeta(
-            max_attempts=(
-                item.max_attempts
-                if item.max_attempts is not None
-                else (meta.max_attempts if meta else defaults.max_attempts)
-            ),
-            backoff=item.backoff if item.backoff is not None else (meta.backoff if meta else defaults.backoff),
-        )
-    return item.fn, meta, item.when
-
-
-def _retry(meta: StepMeta | None, defaults: RuntimeConfig) -> tuple[int, tuple[float, ...]]:
-    if meta is None:
-        return defaults.max_attempts, defaults.backoff
-    return meta.max_attempts, meta.backoff
+    return definition, handlers

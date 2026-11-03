@@ -21,9 +21,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Driver loop — the leader-elected dispatcher. Scaling past that needs a sharded lock, which this does not
-implement.
-"""
 
 from __future__ import annotations
 
@@ -38,28 +35,20 @@ from croniter import croniter
 from forktex import iso
 from forktex.database import try_advisory_lock
 from forktex.log import get_logger
-from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from forktex_flow.domain.types import RunClaim
-from forktex_flow.errors import FlowError
-from forktex_flow.persist import runs as _runs
-from forktex_flow.persist import steps as _steps
-from forktex_flow.persist.models import Run, ScheduledRun, StepRun, Workflow
-from forktex_flow.persist.store import rowcount
-from forktex_flow.runtime.execution import execute_run
+from forktex_flow.persist import definitions as _definitions
+from forktex_flow.persist import jobs as _jobs
+from forktex_flow.persist.models import Schedule
+from forktex_flow.runtime.engine import Advance, notify
+from forktex_flow.runtime.worker import run_job
 
 if TYPE_CHECKING:
-    from forktex_flow.domain.definition import WorkflowDefinition
+    from forktex_flow.domain.types import Job
     from forktex_flow.runtime.context import FlowRuntime
 
 __all__ = ["Driver"]
 
 logger = get_logger(__name__)
-
-#: Runs claimed per tick. Small on purpose: a claim marks rows `running`, so a
-#: large batch that the worker then dies holding takes a stale-reclaim cycle to
-#: come back.
 
 
 class Driver:
@@ -67,272 +56,215 @@ class Driver:
         self.runtime = runtime
         self.shutdown = asyncio.Event()
         self.is_leader = False
-        #: In-flight run tasks, so shutdown can join them.
-        self._tasks: set[asyncio.Task[None]] = set()
-        #: run_id → task. A step whose heartbeat merely lagged (a GC pause, a
-        #: drained pool) can be reclaimed to `pending` while its original
-        #: `execute_run` task is still alive, and the run row follows it. Without
-        #: this map the next tick would start a second `execute_run` for the same
-        #: run while the first is inside a step body — silent double execution of
-        #: anything not idempotent.
+        #: element_run id → its task. A job reclaimed while its handler is merely slow must not run twice here.
         self._in_flight: dict[UUID, asyncio.Task[None]] = {}
-        #: Cleared whenever leadership is lost, so each new leader seeds once.
-        self._schedules_seeded = False
+        self._unclaimed: set[str] = set()
 
     async def run(self) -> None:
+        leader = asyncio.create_task(self._lead(), name="forktex_flow.leader")
+        claiming = _Outage("claiming jobs")
+        try:
+            while not self.shutdown.is_set():
+                self.runtime.wake.clear()
+                full = False
+                try:
+                    full = await self._claim_and_dispatch()
+                    claiming.ended()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    claiming.failed()
+                if not full:
+                    await self._pause(self.runtime.config.poll_interval, self.runtime.wake)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.shutdown.set()
+            leader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await leader
+            await self._drain()
+
+    async def _claim_and_dispatch(self) -> bool:
+        """Whether it claimed as many jobs as it had room for, so more may be waiting."""
+        headroom = self.runtime.config.max_concurrent_jobs - len(self._in_flight)
+        jobs = await _jobs.claim(self.runtime.store, self.runtime.registry.task_types(), headroom)
+        for job in jobs:
+            self._dispatch(job)
+        return headroom > 0 and len(jobs) == headroom
+
+    def _dispatch(self, job: Job) -> None:
+        if job.element_run_id in self._in_flight:
+            logger.warning("forktex_flow.driver: job %s was reclaimed while still in flight here", job.element_run_id)
+            return
+        task = asyncio.create_task(self._run(job), name=f"forktex_flow.job[{job.element_run_id}]")
+        self._in_flight[job.element_run_id] = task
+        task.add_done_callback(lambda _task, run_id=job.element_run_id: self._in_flight.pop(run_id, None))
+
+    async def _run(self, job: Job) -> None:
+        try:
+            await run_job(self.runtime, job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The outcome did not commit; the job stays running until reclaim hands it back.
+            logger.warning(
+                "forktex_flow.driver: job %s could not record its outcome; it will be reclaimed: %s",
+                job.element_run_id,
+                str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+            )
+            logger.debug("forktex_flow.driver: job %s outcome failure", job.element_run_id, exc_info=True)
+
+    async def _lead(self) -> None:
+        leading = _Outage("leading")
         while not self.shutdown.is_set():
             try:
-                await self._compete_for_leadership()
+                await self._compete()
+                leading.ended()
             except asyncio.CancelledError:
-                break
+                raise
             except Exception:
-                logger.exception("driver loop crashed; retrying after backoff")
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(self.shutdown.wait(), timeout=5.0)
-        await self._drain_tasks()
+                leading.failed()
+                await self._pause(5.0)
 
-    async def _compete_for_leadership(self) -> None:
-        async with try_advisory_lock(self.runtime.store.engine, self.runtime.config.leader_lock_key) as is_leader:
-            if not is_leader:
-                self.is_leader = False
-                # A timeout here is the normal case — not the leader, so wait a
-                # beat rather than hot-looping on the election.
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(self.shutdown.wait(), timeout=self.runtime.config.election_interval)
+    async def _compete(self) -> None:
+        key = self.runtime.config.leader_lock_key
+        async with try_advisory_lock(self.runtime.store.engine, key) as acquired:
+            if not acquired:
+                await self._pause(self.runtime.config.election_interval)
                 return
-
             self.is_leader = True
-            logger.info("forktex_flow.driver: this worker is now leader (schema=%s)", self.runtime.store.schema)
+            logger.info("forktex_flow.driver: this worker now leads schema %s", self.runtime.store.schema)
+            phases = (self._fire_due_schedules, self._reclaim_stale, self._report_unclaimed)
+            outages = {phase: _Outage(phase.__name__.strip("_").replace("_", " ")) for phase in phases}
             try:
-                while not self.shutdown.is_set():
-                    if not await self._still_leader():
-                        logger.warning("forktex_flow.driver: leader lock was released; standing down")
-                        return
-                    await self._tick()
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(self.shutdown.wait(), timeout=self.runtime.config.poll_interval)
+                while not self.shutdown.is_set() and await self._still_leader():
+                    for phase in phases:
+                        try:
+                            await phase()
+                            outages[phase].ended()
+                        except Exception:
+                            outages[phase].failed()
+                    await self._pause(self.runtime.config.poll_interval)
             finally:
                 self.is_leader = False
-                self._schedules_seeded = False
 
     async def _still_leader(self) -> bool:
-        """Whether this worker's advisory lock is still held. An advisory lock is session-scoped, so a second non-
-        blocking attempt must fail while we hold it. Succeeding means Postgres released ours — the backend was
-        terminated, restarted or recycled by a pooler — and the lock's own context manager cannot tell us,
-        reporting only whether the acquire succeeded. A failed acquire only proves *somebody* holds the lock, so
-        a worker that never led must answer for itself rather than read the probe.
+        """A second non-blocking acquire must fail while this session holds the lock; succeeding means Postgres
+        released it — a terminated backend, a recycled pooler connection.
         """
-        if not self.is_leader:
-            return False
         async with try_advisory_lock(self.runtime.store.engine, self.runtime.config.leader_lock_key) as acquired:
+            if acquired:
+                logger.warning("forktex_flow.driver: the leader lock was released; standing down")
             return not acquired
 
-    async def _tick(self) -> None:
-        """One pass. Each phase is isolated: a failure in one must not stop the others, which recover independent
-        kinds of stuck work.
-        """
-        phases = (
-            self._fire_due_schedules,
-            self._reclaim_stale,
-            self._revive_abandoned_runs,
-            self._claim_and_dispatch,
-        )
-        for phase in phases:
-            try:
-                await phase()
-            except Exception:
-                logger.exception("driver phase %s failed", phase.__name__)
-
-    async def _claim_and_dispatch(self) -> None:
-        headroom = self.runtime.config.max_concurrent_runs - len(self._in_flight)
-        if headroom <= 0:
-            return
-        for claim in await _runs.claim_pending_runs(self.runtime.store, limit=headroom):
-            self._dispatch(claim)
-
-    def _dispatch(self, claim: RunClaim) -> None:
-        run_id = claim.run_id
-        if run_id in self._in_flight:
-            logger.warning(
-                "forktex_flow.driver: run %s was reclaimed while still in flight; skipping duplicate dispatch",
-                run_id,
-            )
-            return
-        task = asyncio.create_task(
-            execute_run(self.runtime, run_id, claim.workflow_name, claim.workflow_version),
-            name=f"forktex_flow.run[{run_id}]",
-        )
-        self._tasks.add(task)
-        self._in_flight[run_id] = task
-        task.add_done_callback(self._tasks.discard)
-        task.add_done_callback(lambda _t, rid=run_id: self._in_flight.pop(rid, None))
-
     async def _reclaim_stale(self) -> None:
-        reclaimed = await _steps.reclaim_stale_steps(self.runtime.store, self.runtime.config.stale_threshold)
+        store, threshold = self.runtime.store, self.runtime.config.stale_threshold
+        for element_run_id in await _jobs.exhausted_stale(store, threshold):
+            async with store.transaction() as session:
+                advance = Advance(self.runtime, session)
+                await advance.fail(element_run_id, "the job stopped heartbeating with no attempts left")
+            await notify(self.runtime, advance.finished)
+        reclaimed = await _jobs.reclaim_stale(store, threshold)
         if reclaimed:
-            logger.info("forktex_flow.driver: reclaimed %d stale steps", reclaimed)
+            logger.info("forktex_flow.driver: reclaimed %d stale job(s)", reclaimed)
+
+    async def _report_unclaimed(self) -> None:
+        unclaimed = await _jobs.unclaimed(self.runtime.store, self.runtime.config.stale_threshold)
+        for task_type, count in unclaimed.items():
+            if task_type not in self._unclaimed:
+                logger.warning(
+                    "forktex_flow.driver: %d job(s) of task type %r are ready and unclaimed; "
+                    "no running process may handle it",
+                    count,
+                    task_type,
+                )
+        self._unclaimed = set(unclaimed)
 
     async def _fire_due_schedules(self) -> None:
-        definitions = self.runtime.registry.scheduled()
-        if not definitions and not await self._has_schedule_rows():
-            # Most consumers register no scheduled workflows. Without this the
-            # driver pays two queries a tick to learn that every tick.
-            return
-
         now = iso.now()
-        if not self._schedules_seeded:
-            await self._ensure_schedule_rows(definitions, now)
-            self._schedules_seeded = True
-
-        for row in await self._due_schedules(now):
+        async with self.runtime.store.transaction() as session:
+            due = list(
+                await session.scalars(
+                    sa.select(Schedule).where(Schedule.enabled.is_(True), Schedule.next_fire_at <= now)
+                )
+            )
+        for row in due:
             try:
-                await self._fire_schedule(row, now)
+                await self._fire(row, now)
             except Exception:
-                logger.exception("scheduled run submit failed for %s v%d", row.workflow_name, row.workflow_version)
+                logger.exception("forktex_flow.driver: firing schedule %s/%s failed", row.namespace, row.key)
 
-    async def _has_schedule_rows(self) -> bool:
-        async with self.runtime.store.transaction() as session:
-            return (await session.execute(select(ScheduledRun.workflow_name).limit(1))).first() is not None
-
-    async def _ensure_schedule_rows(self, definitions: list[WorkflowDefinition], now: datetime) -> None:
-        """Give every registered scheduled workflow a row. Two upserts per schedule, so this runs once per
-        leadership term rather than once per tick: the registry is fixed before the driver starts, and every
-        call after the first is a no-op the database still has to parse and lock.
+    async def _fire(self, row: Schedule, now: datetime) -> None:
+        """Advance the schedule and start its instance in one transaction. The next fire counts from ``now``, so a
+        leader that fell behind does not work through every occurrence it slept past.
         """
-        if not definitions:
-            return
-        async with self.runtime.store.transaction() as session:
-            for defn in definitions:
-                cron = defn.schedule
-                if cron is None:
-                    # `registry.scheduled()` filters on `schedule is not None`,
-                    # so this is a registry bug, not a data case. Fail loudly
-                    # rather than skip the schedule in silence.
-                    raise FlowError(f"scheduled workflow {defn.name!r} carries no cron expression")
-                await session.execute(
-                    pg_insert(Workflow)
-                    .values(name=defn.name, version=defn.version)
-                    .on_conflict_do_nothing(index_elements=[Workflow.name, Workflow.version])
-                )
-                await session.execute(
-                    pg_insert(ScheduledRun)
-                    .values(
-                        workflow_name=defn.name,
-                        workflow_version=defn.version,
-                        cron=cron,
-                        enabled=defn.enabled,
-                        next_fire_at=croniter(cron, now).get_next(datetime),
-                    )
-                    # The cron is updated on conflict so editing a schedule in
-                    # code takes effect; `next_fire_at` is left alone, so the
-                    # new expression applies from the next fire rather than
-                    # retroactively moving a deadline that may already be due.
-                    # `enabled` is absent by design: it is set from the
-                    # definition on the first insert and owned by the database
-                    # afterwards, so an operator arming a schedule keeps it
-                    # armed across every subsequent deploy.
-                    .on_conflict_do_update(
-                        index_elements=[ScheduledRun.workflow_name, ScheduledRun.workflow_version],
-                        set_={"cron": cron},
-                    )
-                )
-
-    async def _due_schedules(self, now: datetime) -> list[ScheduledRun]:
-        async with self.runtime.store.transaction() as session:
-            rows = (
-                await session.execute(
-                    select(ScheduledRun).where(
-                        ScheduledRun.enabled.is_(True),
-                        ScheduledRun.next_fire_at <= now,
-                    )
-                )
-            ).scalars()
-            return list(rows)
-
-    async def _fire_schedule(self, row: ScheduledRun, now: datetime) -> bool:
-        """Advance one schedule and insert its run in one transaction, reporting whether this worker won the
-        occurrence. Separately, a failed insert consumes the occurrence: the schedule has moved on and
-        ``last_fired_at`` claims a run that does not exist. The next fire is computed from ``now``, not from the
-        missed deadline, so a leader that fell behind does not work through a backlog of every occurrence it
-        slept past.
-        """
-        statement = (
-            update(ScheduledRun)
+        won = (
+            sa.update(Schedule)
             .where(
-                ScheduledRun.workflow_name == row.workflow_name,
-                ScheduledRun.workflow_version == row.workflow_version,
-                ScheduledRun.next_fire_at == row.next_fire_at,
-                ScheduledRun.enabled.is_(True),
+                Schedule.namespace == row.namespace,
+                Schedule.key == row.key,
+                Schedule.next_fire_at == row.next_fire_at,
+                Schedule.enabled.is_(True),
             )
             .values(next_fire_at=croniter(row.cron, now).get_next(datetime), last_fired_at=now)
-            .returning(ScheduledRun.workflow_name)
+            .returning(Schedule.key)
             .execution_options(synchronize_session=False)
         )
         async with self.runtime.store.transaction() as session:
-            if (await session.execute(statement)).first() is None:
-                return False
-            await _runs.insert_run_in(
-                session,
-                self.runtime.store.schema,
-                workflow_name=row.workflow_name,
-                workflow_version=row.workflow_version,
-                input={},
-                metadata={},
-                triggered_by="schedule",
-            )
-        return True
+            if (await session.execute(won)).first() is None:
+                return
+            definition = await _definitions.find(session, row.namespace, row.key)
+            if definition is None:
+                logger.warning("forktex_flow.driver: schedule %s/%s has no deployed definition", row.namespace, row.key)
+                return
+            advance = Advance(self.runtime, session)
+            variables = self.runtime.registry.initial(row.key, {})
+            await advance.start(definition, variables=variables, metadata={}, triggered_by="schedule")
+        await notify(self.runtime, advance.finished)
 
-    async def _revive_abandoned_runs(self) -> None:
-        ready = (
-            select(StepRun.run_id)
-            .where(
-                StepRun.status == "pending",
-                sa.or_(
-                    StepRun.next_attempt_at.is_(None),
-                    StepRun.next_attempt_at <= sa.func.now(),
-                ),
-            )
-            .scalar_subquery()
-        )
-        holds_a_live_step = select(StepRun.id).where(StepRun.run_id == Run.id, StepRun.status == "running").exists()
-        cutoff = sa.func.now() - sa.cast(
-            sa.func.make_interval(0, 0, 0, 0, 0, 0, self.runtime.config.stale_threshold),
-            sa.Interval,
-        )
-        async with self.runtime.store.transaction() as session:
-            result = await session.execute(
-                update(Run)
-                .where(
-                    Run.status == "running",
-                    sa.or_(
-                        Run.id.in_(ready),
-                        sa.and_(
-                            ~holds_a_live_step,
-                            sa.or_(Run.heartbeat_at.is_(None), Run.heartbeat_at < cutoff),
-                        ),
-                    ),
-                )
-                .values(status="pending")
-            )
-            revived = rowcount(result)
-        if revived:
-            logger.info("forktex_flow.driver: revived %d abandoned run(s)", revived)
-
-    async def _drain_tasks(self, timeout: float = 30.0) -> None:
-        if not self._tasks:
-            return
+    async def _pause(self, seconds: float, wake: asyncio.Event | None = None) -> None:
+        waits = [asyncio.ensure_future(event.wait()) for event in (self.shutdown, wake) if event is not None]
         try:
-            await asyncio.wait_for(asyncio.gather(*self._tasks, return_exceptions=True), timeout=timeout)
-        except TimeoutError:
-            # `wait_for` cancels the gather it was waiting on, and cancelling a
-            # gather cancels its children — so these runs were interrupted
-            # mid-step. Their rows stay `running` until a heartbeat goes stale
-            # and the next leader reclaims them.
-            cancelled = [task for task in self._tasks if task.cancelled()]
+            await asyncio.wait(waits, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for waiter in waits:
+                waiter.cancel()
+
+    async def _drain(self) -> None:
+        # A snapshot: each task's done-callback removes it from `_in_flight`.
+        in_flight = list(self._in_flight.values())
+        if not in_flight:
+            return
+        timeout = self.runtime.config.drain_timeout
+        _done, pending = await asyncio.wait(in_flight, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending)
             logger.warning(
-                "forktex_flow.driver: %d of %d runs were still in flight after %.0fs and were "
-                "cancelled mid-step; they will be reclaimed once their heartbeat goes stale",
-                len(cancelled),
-                len(self._tasks),
+                "forktex_flow.driver: %d of %d jobs were still running after %.0fs; they were handed back as pending",
+                len(pending),
+                len(in_flight),
                 timeout,
             )
+
+
+class _Outage:
+    """A stretch of failures logs once with its traceback and once when it ends, not once per poll."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+        self.failing = False
+
+    def failed(self) -> None:
+        if self.failing:
+            logger.debug("forktex_flow.driver: %s still failing", self.what, exc_info=True)
+            return
+        self.failing = True
+        logger.warning("forktex_flow.driver: %s failed; retrying quietly until it succeeds", self.what, exc_info=True)
+
+    def ended(self) -> None:
+        if self.failing:
+            self.failing = False
+            logger.info("forktex_flow.driver: %s works again", self.what)
