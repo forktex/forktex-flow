@@ -37,6 +37,7 @@ from forktex_flow.domain.jsonlogic import check_rule
 
 __all__ = [
     "ACTIVITY_SEPARATOR",
+    "PRIVATE_SEPARATOR",
     "Activation",
     "AdHocDecision",
     "AdHocSubProcess",
@@ -124,6 +125,9 @@ Element = Annotated[
 #: Separates an ad-hoc subprocess, its round and position, and its activity in a run's id: ``agent/2.1/search``.
 ACTIVITY_SEPARATOR = "/"
 
+#: A task type ``<key>:<name>`` is a code pipeline's private step: only definitions keyed ``<key>`` may use it.
+PRIVATE_SEPARATOR = ":"
+
 
 class SequenceFlow(BaseWireValueObject):
     id: str
@@ -187,6 +191,12 @@ def _problems(model: ProcessModel) -> list[str]:
     ]
     problems = [f"element id {i!r} is used twice" for i in sorted({i for i in ids if ids.count(i) > 1})]
     problems += problems_inner
+    owners = {task_type: task_type.rsplit(PRIVATE_SEPARATOR, 1)[0] for task_type in _task_types(model)}
+    problems += [
+        f"task type {task_type!r} is a step of pipeline {owner!r}, and only that pipeline may use it"
+        for task_type, owner in sorted(owners.items())
+        if PRIVATE_SEPARATOR in task_type and owner != model.key
+    ]
     flow_ids = [flow.id for flow in model.flows]
     problems += [f"flow id {i!r} is used twice" for i in sorted({i for i in flow_ids if flow_ids.count(i) > 1})]
     known = set(ids)
@@ -208,6 +218,16 @@ def _problems(model: ProcessModel) -> list[str]:
         problems += _element_problems(model, element)
     problems += _graph_problems(model)
     return problems
+
+
+def _task_types(model: ProcessModel) -> set[str]:
+    found: set[str] = set()
+    for element in model.elements:
+        if isinstance(element, ServiceTask | AdHocSubProcess):
+            found.add(element.task_type)
+        if isinstance(element, AdHocSubProcess):
+            found.update(activity.task_type for activity in element.elements)
+    return found
 
 
 def _element_problems(model: ProcessModel, element: Element) -> list[str]:

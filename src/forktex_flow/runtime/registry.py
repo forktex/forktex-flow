@@ -25,12 +25,12 @@
 from __future__ import annotations
 
 from forktex.error import AlreadyExistsError
-from forktex.types import BaseValueObject
-from pydantic import Field
+from forktex.types import BaseValueObject, JsonObject
+from pydantic import BaseModel, Field
 
-from forktex_flow.domain.node import HandlerFn, WhenFn
+from forktex_flow.domain.node import HandlerFn
 from forktex_flow.domain.process import ProcessModel
-from forktex_flow.domain.state import ReducerFn
+from forktex_flow.domain.state import ReducerFn, validate_state
 
 __all__ = ["CodeDefinition", "FlowRegistry", "Handler"]
 
@@ -38,12 +38,14 @@ __all__ = ["CodeDefinition", "FlowRegistry", "Handler"]
 class Handler(BaseValueObject):
     task_type: str
     fn: HandlerFn
-    when: WhenFn | None = None
+    #: A pydantic model the handler receives its variables as; ``None`` hands it the dict.
+    state: type[BaseModel] | None = None
 
 
 class CodeDefinition(BaseValueObject):
     model: ProcessModel
     reducers: dict[str, ReducerFn] = Field(default_factory=dict)
+    state: type[BaseModel] | None = None
     cron: str | None = None
     enabled: bool = True
 
@@ -79,6 +81,15 @@ class FlowRegistry(BaseValueObject):
     def reducers(self, key: str) -> dict[str, ReducerFn]:
         definition = self.definitions.get(key)
         return {} if definition is None else definition.reducers
+
+    def initial(self, key: str, variables: JsonObject) -> JsonObject:
+        """An instance's starting variables: validated against the pipeline's pydantic state, defaults filled in.
+        Raises ``BadRequestError`` naming what does not match.
+        """
+        definition = self.definitions.get(key)
+        if definition is None or definition.state is None:
+            return variables
+        return {**variables, **validate_state(definition.state, variables).model_dump(mode="json")}
 
     def keys(self) -> list[str]:
         return sorted(self.definitions)

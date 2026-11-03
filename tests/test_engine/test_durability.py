@@ -37,7 +37,7 @@ from tests.conftest import FAST, until
 
 
 def _pipeline(flow: Flow, *steps) -> None:
-    flow.pipeline("deploy")(type("Deploy", (), {"steps": list(steps)}))
+    flow.pipeline("deploy", steps=list(steps))
 
 
 async def _abandon(flow: Flow, element_id: str) -> None:
@@ -66,30 +66,35 @@ async def test_a_job_abandoned_by_a_dead_worker_is_reclaimed_and_completed_steps
         calls.append("configure")
         return {"configured": state["server"]}
 
+    def declare(flow: Flow) -> None:
+        flow.handler("deploy.provision")(provision)
+        flow.handler("deploy.configure")(configure)
+        _pipeline(flow, "deploy.provision", "deploy.configure")
+
     async with Flow(postgres_url_str, schema=schema, config=FAST) as flow:
-        _pipeline(flow, provision, configure)
+        declare(flow)
         instance = await flow.start("deploy")
 
     # A worker that handles only the first step.
     async with Flow(postgres_url_str, schema=schema, config=FAST, drive=True) as first:
-        first.handler("deploy:provision")(provision)
+        first.handler("deploy.provision")(provision)
         await first.start_driver()
         await until(lambda: calls == ["provision"])
 
     # A worker that claimed `configure` and died before writing anything.
     async with Flow(postgres_url_str, schema=schema, config=FAST) as crashed:
-        _pipeline(crashed, provision, configure)
-        await _abandon(crashed, "configure")
+        declare(crashed)
+        await _abandon(crashed, "deploy.configure")
 
     async with Flow(postgres_url_str, schema=schema, config=FAST, drive=True) as survivor:
-        _pipeline(survivor, provision, configure)
+        declare(survivor)
         await survivor.init()
         await survivor.start_driver()
         done = await (await survivor.get(instance.instance_id)).wait(timeout=10)
 
     assert done.status == "completed"
     assert calls == ["provision", "configure"]
-    assert done.element("configure").attempts == 2
+    assert done.element("deploy.configure").attempts == 2
 
 
 @pytest.mark.asyncio

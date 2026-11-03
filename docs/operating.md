@@ -1,7 +1,19 @@
 # Operating `forktex-flow`
 
 What the engine guarantees under failure, how processes share the work, what to
-watch, and the tables it owns. The API is in [`flow.md`](flow.md).
+watch, and the tables it owns. The API is in the [reference](reference.md).
+
+## Database
+
+- PostgreSQL 14 or newer is the only supported database. Everything the engine
+  knows lives there; the processes hold nothing that a restart loses.
+- The database user needs to create the `forktex_flow` schema on first start
+  (or own one created in advance). The engine creates and alters tables only in
+  that schema.
+- Connect directly or through a pooler in session mode. Leader election holds a
+  session-level advisory lock, which transaction-mode pooling breaks.
+- Every process pointed at the same database and schema shares one set of
+  workflows. A different `schema=` is a separate, independent set.
 
 ## Durability
 
@@ -99,7 +111,9 @@ element visited; neither is pruned for you.
 
 ## Operator actions
 
-**Arm or disarm a schedule.** `enabled=` is read only when the row is first
+### Arm or disarm a schedule
+
+`enabled=` is read only when the row is first
 written; afterwards the flag lives only in the database.
 
 ```sql
@@ -110,7 +124,9 @@ UPDATE forktex_flow.schedule SET enabled = true
  WHERE namespace = 'default' AND key = 'billing.close_day';
 ```
 
-**Prune history.** Deleting a terminal instance cascades to its elements, its
+### Prune history
+
+Deleting a terminal instance cascades to its elements, its
 events and its children:
 
 ```sql
@@ -120,7 +136,9 @@ DELETE FROM forktex_flow.instance
    AND finished_at < now() - interval '90 days';
 ```
 
-**Reset the schema.** There is no downgrade. A schema that cannot be migrated
+### Reset the schema
+
+There is no downgrade. A schema that cannot be migrated
 forward is dropped and rebuilt by the next `Flow.init()`, which also redeploys
 every declared workflow; schedules come back as their declarations say.
 

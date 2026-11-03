@@ -45,11 +45,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "forktex>=0.15,<0.16",
-    "sqlalchemy[asyncio]>=2.0",
-    "asyncpg>=0.31",
-    "pydantic>=2.0",
-    "croniter>=2.0",
+    "forktex>=1.0,<2",
+    "sqlalchemy[asyncio]>=2.1.6",
+    "asyncpg>=0.32",
+    "pydantic>=2.14",
+    "croniter>=6.2",
 ]
 
 
@@ -73,17 +73,17 @@ include = [
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
-    "pytest-cov>=6.0",
-    "ruff>=0.8.0",
-    "pyright>=1.1.350",
-    "pip-audit>=2.7.0",
-    "build>=1.2.0",
-    "twine>=5.0.0",
+    "pytest>=9.2",
+    "pytest-asyncio>=1.4",
+    "pytest-cov>=7.1",
+    "ruff>=0.17.3",
+    "pyright>=1.1.414",
+    "pip-audit>=2.10.1",
+    "build>=1.6.1",
+    "twine>=7.0",
     "testcontainers[postgres]>=4.15",
-    "alembic (>=1.14)",
-    "pytest-timeout (>=2.3)",
+    "alembic>=1.20",
+    "pytest-timeout>=2.4",
 ]
 
 [tool.ruff]

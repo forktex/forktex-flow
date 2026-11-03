@@ -54,8 +54,9 @@ def _assert_running_from_site_packages() -> None:
 async def main() -> int:
     _assert_running_from_site_packages()
 
-    from forktex_flow import Ctx, Flow, RuntimeConfig, step
     from testcontainers.community.postgres import PostgresContainer
+
+    from forktex_flow import Ctx, Flow, RuntimeConfig, step
 
     container = PostgresContainer("postgres:17-alpine")
     container.start()
@@ -71,9 +72,7 @@ async def main() -> int:
     async def guarded(ctx: Ctx, state: State) -> dict:
         return {"logs": ["guarded"]}
 
-    @flow.pipeline("smoke.pipeline", state=State)
-    class Smoke:
-        steps = [first, step(guarded, when=lambda s: s.get("enabled", False))]
+    flow.pipeline("smoke.pipeline", state=State, steps=[first, step(guarded, when={"var": "enabled"})])
 
     try:
         # Proves the .sql migrations shipped AND that the runner finds them through the installed package.

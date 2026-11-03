@@ -26,13 +26,11 @@
 from __future__ import annotations
 
 import pytest
-import sqlalchemy as sa
 from forktex import iso
 from forktex.database import reflect
 from forktex.error import BadRequestError
 
 from forktex_flow import Activation, AdHocDecision, Flow, isolated_flow, make_ctx, run_to_completion
-from forktex_flow.persist.models import InstanceEvent
 from tests.test_engine.test_definitions import linear
 
 
@@ -142,25 +140,18 @@ async def test_a_handler_s_events_land_in_the_instance_log(flow: Flow):
 
     await flow.deploy(linear("k", "work"))
     done = await run_to_completion(flow, "k")
+    events = await done.events()
+    after_first = await done.events(after=events[0].id, limit=1)
 
-    async with flow.transaction() as session:
-        rows = (
-            await session.execute(
-                sa.select(InstanceEvent.event_type, InstanceEvent.payload)
-                .where(InstanceEvent.instance_id == done.instance_id)
-                .order_by(InstanceEvent.id)
-            )
-        ).all()
-
-    types = [row.event_type for row in rows]
-    assert types[0] == "instance_started" and types[-1] == "instance_completed"
-    assert ("progress", {"percent": 50}) in [(row.event_type, row.payload) for row in rows]
+    assert events[0].event_type == "instance_started" and events[-1].event_type == "instance_completed"
+    assert ("progress", {"percent": 50}) in [(event.event_type, event.payload) for event in events]
+    assert after_first == [events[1]]
 
 
 @pytest.mark.asyncio
 async def test_isolated_flow_gives_a_throwaway_schema(postgres_url_str: str):
     async with isolated_flow(postgres_url_str) as flow:
-        flow.handler("work")(lambda ctx, variables: _empty())
+        flow.handler("work")(_empty)
         await flow.deploy(linear("k", "work"))
         done = await run_to_completion(flow, "k")
         schema = flow.schema
@@ -172,5 +163,5 @@ async def test_isolated_flow_gives_a_throwaway_schema(postgres_url_str: str):
     await probe.close()
 
 
-async def _empty() -> dict:
+async def _empty(ctx: object, variables: dict) -> dict:
     return {}

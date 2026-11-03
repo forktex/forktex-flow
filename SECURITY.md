@@ -24,7 +24,9 @@ to the Postgres database you give it. The security-relevant surface:
   operators — no code execution. BPMN XML with a DOCTYPE is refused, which closes
   entity expansion, and the parser never fetches external resources.
 - **Handlers are yours.** A definition can only name task types; it runs code only
-  through the handlers your process registered.
+  through the handlers your process registered. A `@flow.handler` task type is
+  usable from every namespace, so a handler that must not serve a tenant checks
+  `ctx.namespace`. A pipeline's own steps cannot be named by any other definition.
 
 ## What this library does not do
 

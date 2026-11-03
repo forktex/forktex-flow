@@ -26,7 +26,7 @@
 handler is given.
 """
 
-from forktex_flow.runtime.compiler import compile_pipeline, compile_scheduled
+from forktex_flow.runtime.compiler import compile_pipeline
 from forktex_flow.runtime.context import FlowRuntime
 from forktex_flow.runtime.ctx import Ctx
 from forktex_flow.runtime.driver import Driver
@@ -43,6 +43,5 @@ __all__ = [
     "FlowRuntime",
     "Handler",
     "compile_pipeline",
-    "compile_scheduled",
     "run_job",
 ]

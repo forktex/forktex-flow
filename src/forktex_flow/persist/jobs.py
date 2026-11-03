@@ -170,7 +170,8 @@ async def unclaimed(store: FlowStore, older_than: float) -> dict[str, int]:
         .group_by(ElementRun.task_type)
     )
     async with store.transaction() as session:
-        return {task_type: count for task_type, count in (await session.execute(statement)).all()}
+        rows = (await session.execute(statement)).all()
+    return {task_type: count for task_type, count in rows if task_type is not None}
 
 
 def _seconds(seconds: float) -> sa.Cast[timedelta]:

@@ -43,6 +43,7 @@ from forktex_flow.domain.types import (
     OPEN_ELEMENT_STATUSES,
     TERMINAL_STATUSES,
     ElementRunInfo,
+    InstanceEventInfo,
     InstanceInfo,
     InstanceSummary,
 )
@@ -73,6 +74,12 @@ class WorkflowInstance(InstanceInfo):
     async def cancel(self, reason: str = "cancelled by operator") -> bool:
         async with self._bound("cancel").transaction() as session:
             return await _instances.cancel(session, self.instance_id, reason)
+
+    async def events(self, *, after: int = 0, limit: int = 100) -> list[InstanceEventInfo]:
+        """The instance's history, oldest first. Pass the last ``id`` seen as ``after`` to read on from there."""
+        if limit < 1:
+            raise BadRequestError("limit must be at least 1")
+        return await _instances.events(self._bound("read events"), self.instance_id, after=after, limit=limit)
 
     async def refresh(self) -> WorkflowInstance:
         store = self._bound("refresh")

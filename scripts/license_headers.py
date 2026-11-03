@@ -12,6 +12,7 @@ Usage:
     python scripts/license_headers.py fix      # add or update headers everywhere
     python scripts/license_headers.py strip     # remove headers from all files
 """
+
 import os
 import re
 import sys
@@ -65,14 +66,25 @@ HTML_EXTS = {".html"}
 SOURCE_EXTS = HASH_EXTS | SLASH_EXTS | CSS_EXTS | HTML_EXTS
 
 SKIP_DIRS = {
-    "node_modules", ".venv", "__pycache__", ".expo", ".git",
-    "api_client", ".next", "dist", "build", ".mypy_cache",
-    "redis-data", "network-db-data", "minio-data",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    ".expo",
+    ".git",
+    "api_client",
+    ".next",
+    "dist",
+    "build",
+    ".mypy_cache",
+    "redis-data",
+    "network-db-data",
+    "minio-data",
     ".forktex",
 }
 
 
 # ── Header formatting ───────────────────────────────────────────────────────
+
 
 def _comment_lines(prefix: str) -> list[str]:
     return [f"{prefix} {line}" if line else prefix for line in HEADER_LINES]
@@ -117,12 +129,13 @@ def has_any_header(content: str) -> bool:
 
 # ── Strip logic ──────────────────────────────────────────────────────────────
 
+
 def strip_header(filepath: str) -> bool:
     """Remove the license header from a file. Returns True if modified."""
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
-    except (UnicodeDecodeError, PermissionError):
+    except UnicodeDecodeError, PermissionError:
         return False
 
     if not has_any_header(content):
@@ -195,7 +208,7 @@ def strip_header(filepath: str) -> bool:
 
     # Reconstruct
     before = search_lines[:start]
-    after = search_lines[end + 1:]
+    after = search_lines[end + 1 :]
 
     # Clean leading blank lines from 'before'
     while before and before[0].strip() == "":
@@ -219,13 +232,14 @@ def strip_header(filepath: str) -> bool:
 
 # ── Add logic ────────────────────────────────────────────────────────────────
 
+
 def add_header(filepath: str) -> bool:
     """Add the license header to a file. Returns True if modified."""
     ext = os.path.splitext(filepath)[1]
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
-    except (UnicodeDecodeError, PermissionError):
+    except UnicodeDecodeError, PermissionError:
         return False
 
     if has_current_header(content):
@@ -250,6 +264,7 @@ def add_header(filepath: str) -> bool:
 
 # ── File collection ──────────────────────────────────────────────────────────
 
+
 def collect_files(root: str) -> list[str]:
     """Walk the tree and collect all source files to process."""
     result = []
@@ -264,6 +279,7 @@ def collect_files(root: str) -> list[str]:
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
+
 
 def main():
     commands = ("check", "fix", "strip")
@@ -294,7 +310,7 @@ def main():
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     content = f.read()
-            except (UnicodeDecodeError, PermissionError):
+            except UnicodeDecodeError, PermissionError:
                 continue
 
             changed = False
@@ -324,7 +340,7 @@ def main():
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     content = f.read()
-            except (UnicodeDecodeError, PermissionError):
+            except UnicodeDecodeError, PermissionError:
                 continue
             if has_current_header(content):
                 continue

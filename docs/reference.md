@@ -1,7 +1,28 @@
 # `forktex_flow` reference
 
-Every public name and its exact behaviour. The [README](../README.md) shows how
-to wire it in; [`operating.md`](operating.md) covers failure and operations.
+Every public name and its exact behaviour. The [guide](guide.md) shows them in
+use; [operating](operating.md) covers failure and deploys.
+
+## The function shape
+
+Every pipeline step and every handler is written exactly like this:
+
+```python
+async def name(ctx: Ctx, state: S) -> dict | BaseModel | None:
+    ...
+```
+
+| Part | Contract |
+|---|---|
+| `async def` with two positional parameters | Anything else (a sync function, one parameter, keyword-only parameters, extra parameters) raises `BadRequestError` at `flow.pipeline(...)`, `step(...)` or `@flow.handler(...)`. |
+| `ctx` | The [`Ctx`](#ctx) of this attempt. |
+| `state` | With a pydantic `state=` model: the variables validated as that model. Variables that no longer match fail the element at once, without retries. Otherwise: the variables as a `dict`. |
+| Returns | Only what changed. A `dict`: every key in it. A pydantic model: only the fields that were set, so an explicit `None` clears a field. `None`: no change. Anything JSONB cannot hold fails the attempt with `StateNotSerialisable`. |
+| Raises | Any exception fails the attempt; it is retried until `max_attempts`. `WorkflowCancelled(reason)` cancels the instance instead. |
+
+Each returned field replaces the stored one, unless the state declares a
+reducer for it (`Annotated[list[str], operator.add]`), which merges the two.
+An element with `resultVariable` stores its output under that name instead.
 
 ## Public surface
 
@@ -10,15 +31,15 @@ to wire it in; [`operating.md`](operating.md) covers failure and operations.
 | Name | What it is |
 |---|---|
 | `Flow` | The facade: one per process and schema. |
-| `Ctx` | The handle every handler is given. |
-| `step`, `StepSpec` | A pipeline step's retry contract, and a guarded pipeline entry. |
+| `Ctx` | The first argument of every step and handler. |
+| `step`, `StepSpec` | A pipeline entry with options, and its type. |
 | `ProcessModel` | A process definition: elements and sequence flows. |
 | `StartEvent`, `EndEvent`, `ServiceTask`, `UserTask`, `ExclusiveGateway`, `CallActivity`, `AdHocSubProcess`, `SequenceFlow` | Its parts. |
 | `AdHocDecision`, `Activation` | What an ad-hoc decider returns. |
 | `parse_bpmn` | BPMN 2.0 XML compiled to a `ProcessModel`. |
 | `DefinitionInfo` | One deployed version: `namespace`, `key`, `version`, `checksum`, `model`, `source`. |
-| `WorkflowInstance` | An instance snapshot, plus `wait` / `refresh` / `stream` / `cancel`. |
-| `InstanceInfo`, `ElementRunInfo` | The snapshot shapes. |
+| `WorkflowInstance` | An instance snapshot, plus `wait` / `refresh` / `stream` / `events` / `cancel`. |
+| `InstanceInfo`, `ElementRunInfo`, `InstanceEventInfo` | The snapshot and history shapes. |
 | `InstanceStatus`, `ElementStatus`, `TERMINAL_STATUSES` | Status vocabularies; an instance never leaves a terminal status. |
 | `DEFAULT_NAMESPACE` | `"default"`: where code-declared workflows live, and every call's default. |
 | `InstanceQuery`, `InstancePage`, `InstanceSummary` | Finding instances. |
@@ -65,39 +86,52 @@ exit, so calling `commit()` inside it raises.
 
 ### Declaring code workflows
 
-| Decorator | Declares |
+| Call | Declares |
 |---|---|
-| `@flow.pipeline(key, *, state=None, cron=None, enabled=True)` | A class whose `steps` list compiles to start → one service task per step → end. `cron=` also schedules it. |
-| `@flow.scheduled(key, *, cron, state=None, enabled=True)` | One async function on a cron. |
-| `@flow.handler(task_type)` | The function run for every service task (or ad-hoc decider) of that type. |
+| `flow.pipeline(key, *, steps, state=None, cron=None, enabled=True)` | start → each step in order → end, deployed into `DEFAULT_NAMESPACE`. `cron=` also schedules it. |
+| `@flow.handler(task_type, *, state=None)` | The function run for every service task (or ad-hoc decider) of that type, in any namespace. |
 
-- A step's element id is its function's name, suffixed by position when names
-  repeat or collide with `start` / `end`. Its task type is `<key>:<element id>`.
-- `state=` is a `TypedDict`. A field annotated with a reducer, such as
-  `Annotated[list[str], operator.add]`, accumulates; every other field is
-  last-write-wins. The reducers apply to that key in every namespace.
+- `steps` holds functions, task types of `@flow.handler`s (shared steps), or
+  `step(...)` of either.
+- `state=` is a pydantic model or a `TypedDict`. A pydantic model is enforced:
+  `start()` raises `BadRequestError` naming every field that does not match, and
+  stores the variables with the model's defaults filled in. A `TypedDict` only
+  declares reducers.
+- A scheduled pipeline starts with no variables, so its `state=` must accept
+  `{}`; otherwise declaring it raises `BadRequestError`.
 - `enabled=False` declares a schedule disarmed. The flag is read only when the
   schedule row is first written.
 - Declarations deploy into `DEFAULT_NAMESPACE` on `init()` or the first
   `start()`. An unchanged one keeps its version.
 - `flow.registered()` lists the declared keys.
-- Declaring a key or task type twice raises `AlreadyExistsError`. A bad cron, or
-  a pipeline with no steps, raises `BadRequestError` when the decorator runs.
-
-A handler is `async def (ctx: Ctx, variables: dict) -> dict | BaseModel | None`.
-Its output merges into the instance's variables. Raising `WorkflowCancelled(reason)`
-cancels the instance.
+- Declaring a key or task type twice raises `AlreadyExistsError`. A bad cron or
+  condition, a pipeline with no steps, or a task type containing `:` raises
+  `BadRequestError` at the call.
 
 ### `step`
 
-| Form | Effect |
-|---|---|
-| `@step(max_attempts=n, backoff=(a, b))` | Decorate a step with its own retry contract. |
-| `step(fn, max_attempts=…, backoff=…)` | The same at the pipeline; each option overrides the decorator's. |
-| `step(fn, when=predicate)` | Run only when `predicate(variables)` is true; otherwise the element is `skipped`. |
+```python
+step(target, /, *, name=None, when=None, max_attempts=None, backoff=None)
+```
 
-What a step leaves unset comes from the `Flow`'s `RuntimeConfig`. A bare `@step`
-changes nothing. `step(when=…)` without `fn` raises `BadRequestError`.
+| Option | Effect |
+|---|---|
+| `target` | A function (a private step) or a handler's task type (a shared step). |
+| `name` | The step's element id. Defaults to the function's name, or the task type. Letters, digits, `_`, `.` and `-`; `start` and `end` are reserved. |
+| `when` | A [JSON Logic](#conditions) condition over the variables. It compiles to an exclusive gateway in front of the step whose default path goes around it, so a false condition never visits the step. |
+| `max_attempts`, `backoff` | The step's retry policy, stored in its definition. Unset, they come from `RuntimeConfig`. |
+
+**Identity.** A private step's task type is `<key>:<name>`. The name is what
+connects a running instance to your code: renaming or removing a step leaves
+instances on the old version waiting at it (see
+[deploying](operating.md#sharing-the-work)). Two steps with one name raise
+`AlreadyExistsError`; give one a `name=`.
+
+**Visibility.** A handler's task type can be used by any definition in any
+namespace. A private step's task type can only be used by a definition with
+the same key, which is the pipeline itself or a copy of it deployed into
+another namespace; deploying any other definition that names it raises
+`BadRequestError`.
 
 ### Definitions
 
@@ -248,9 +282,20 @@ The fields:
 | `await instance.wait(timeout=None)` | The snapshot once terminal, or at the timeout. A timeout is not an error. |
 | `await instance.refresh()` | A fresh snapshot. |
 | `async for s in instance.stream()` | A snapshot per change, ending with the terminal one. |
+| `await instance.events(*, after=0, limit=100)` | The history as `InstanceEventInfo` (`id`, `instance_id`, `ts`, `event_type`, `payload`), oldest first. Pass the last `id` seen as `after` to read on. |
 | `await instance.cancel(reason=…)` | `True` if it took effect. Cancels active children and stops a running handler at its next heartbeat. `False` if the instance had already finished. |
 | `instance.current_elements` | The elements holding the token: pending or running jobs, waiting tasks and calls. |
 | `instance.element(element_id)` | That element's run, or `None`. |
+
+An `ElementRunInfo` has `element_id`, `element_type`, `task_type`, `status`
+(`pending`, `running`, `waiting`, `completed`, `failed`, `cancelled`), `input`,
+`output`, `error`, `attempts`, `max_attempts`, `next_attempt_at`,
+`started_at`, `finished_at`, `heartbeat_at` and `child_instance_id`.
+
+The engine's events are `instance_started`, `element_started`,
+`element_retried`, `element_completed`, `element_failed`, `task_waiting`,
+`adhoc_round`, `instance_completed`, `instance_failed` and
+`instance_cancelled`. A handler adds its own with `ctx.emit()`.
 
 ## `InstanceQuery`
 
@@ -276,7 +321,7 @@ same way.
 
 | Member | |
 |---|---|
-| `instance_id`, `namespace`, `key`, `version` | The instance and its definition. |
+| `instance_id`, `namespace`, `key`, `version` | The instance and its definition. A handler shared across namespaces tells customers apart by `namespace`. |
 | `element_id`, `task_type` | The element being run. |
 | `attempt`, `max_attempts`, `final_attempt` | This attempt, counting from 1; whether a failure now fails the instance. |
 | `metadata` | The instance's metadata. |
@@ -325,10 +370,10 @@ A terminal hook that raises is logged; the instance's outcome is unaffected.
 
 | Error | Raised when |
 |---|---|
-| `BadRequestError` | A definition, document, cron or config that cannot run. |
+| `BadRequestError` | A definition, document, cron, condition or config that cannot run; a step or handler of another shape; variables that do not match a pipeline's pydantic state at `start()`. |
 | `NotFoundError` | An undeployed key or version, an unknown instance, or no such user task. |
 | `ConflictError` | Completing a user task that is not waiting. |
-| `AlreadyExistsError` | A key or task type declared twice in one `Flow`. |
+| `AlreadyExistsError` | A key or task type declared twice in one `Flow`, or two steps of one pipeline with one name. |
 | `StateNotSerialisable` | Variables that JSONB cannot hold: at `start()`, or as a failed attempt. |
 | `FlowClosed` | Any call after `close()`. |
 | `WorkflowCancelled` | Raised by you in a handler, to cancel its instance. |

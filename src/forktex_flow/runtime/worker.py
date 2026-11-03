@@ -29,12 +29,12 @@ import contextlib
 import traceback
 from typing import TYPE_CHECKING
 
+from forktex.error import BadRequestError
 from forktex.log import get_logger
 from forktex.types import JsonObject
-from pydantic import BaseModel
 
 from forktex_flow.domain.process import AdHocSubProcess, ServiceTask
-from forktex_flow.domain.state import check_variables
+from forktex_flow.domain.state import to_variables, validate_state
 from forktex_flow.errors import WorkflowCancelled
 from forktex_flow.persist import instances as _instances
 from forktex_flow.persist import jobs as _jobs
@@ -71,9 +71,14 @@ async def run_job(runtime: FlowRuntime, job: Job) -> None:
         await _fail(runtime, job, f"no handler for task type {job.task_type!r} in this process")
         return
 
-    if handler.when is not None and not handler.when(variables):
-        await _complete(runtime, job, {}, skipped=True)
-        return
+    state: object = variables
+    if handler.state is not None:
+        try:
+            state = validate_state(handler.state, variables)
+        except BadRequestError as exc:
+            # Retrying cannot change the variables, so this fails the element at once.
+            await _fail(runtime, job, exc.message)
+            return
 
     ctx = Ctx(
         instance_id=job.instance_id,
@@ -94,13 +99,10 @@ async def run_job(runtime: FlowRuntime, job: Job) -> None:
         )
 
     lost = asyncio.Event()
-    body = asyncio.create_task(handler.fn(ctx, variables), name=f"forktex_flow.job[{job.element_run_id}]")
+    body = asyncio.create_task(handler.fn(ctx, state), name=f"forktex_flow.job[{job.element_run_id}]")
     beat = asyncio.create_task(_heartbeat(runtime, job, body, lost))
     try:
-        output = await body
-        if isinstance(output, BaseModel):
-            output = output.model_dump(mode="json", exclude_none=True)
-        check_variables(output)
+        output = to_variables(await body)
     except asyncio.CancelledError:
         if lost.is_set():
             logger.info("job %s is no longer running; its handler was stopped", job.element_run_id)
@@ -118,13 +120,13 @@ async def run_job(runtime: FlowRuntime, job: Job) -> None:
         beat.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await beat
-    await _complete(runtime, job, output or {})
+    await _complete(runtime, job, output)
 
 
-async def _complete(runtime: FlowRuntime, job: Job, output: JsonObject, *, skipped: bool = False) -> None:
+async def _complete(runtime: FlowRuntime, job: Job, output: JsonObject) -> None:
     async with runtime.store.transaction() as session:
         advance = Advance(runtime, session)
-        await advance.complete(job.element_run_id, output, skipped=skipped)
+        await advance.complete(job.element_run_id, output)
     await notify(runtime, advance.finished)
 
 

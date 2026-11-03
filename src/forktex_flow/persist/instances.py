@@ -30,7 +30,7 @@ import sqlalchemy as sa
 from forktex import iso
 from forktex.types import JsonObject
 
-from forktex_flow.domain.types import OPEN_ELEMENT_STATUSES, InstanceInfo
+from forktex_flow.domain.types import OPEN_ELEMENT_STATUSES, InstanceEventInfo, InstanceInfo
 from forktex_flow.persist.mappers import to_instance_info
 from forktex_flow.persist.models import ElementRun, Instance, InstanceEvent
 
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
     from forktex_flow.persist.store import FlowStore
 
-__all__ = ["cancel", "close_open_elements", "emit", "fetch", "lock"]
+__all__ = ["cancel", "close_open_elements", "emit", "events", "fetch", "lock"]
 
 
 def emit(session: AsyncSession, instance_id: UUID, event_type: str, payload: JsonObject | None = None) -> None:
@@ -52,6 +52,22 @@ async def fetch(store: FlowStore, instance_id: UUID) -> InstanceInfo | None:
     async with store.transaction() as session:
         row = await session.get(Instance, instance_id)
         return None if row is None else to_instance_info(row)
+
+
+async def events(store: FlowStore, instance_id: UUID, *, after: int, limit: int) -> list[InstanceEventInfo]:
+    statement = (
+        sa.select(InstanceEvent)
+        .where(InstanceEvent.instance_id == instance_id, InstanceEvent.id > after)
+        .order_by(InstanceEvent.id)
+        .limit(limit)
+    )
+    async with store.transaction() as session:
+        return [
+            InstanceEventInfo(
+                id=row.id, instance_id=row.instance_id, ts=row.ts, event_type=row.event_type, payload=row.payload
+            )
+            for row in await session.scalars(statement)
+        ]
 
 
 async def lock(session: AsyncSession, instance_id: UUID) -> Instance | None:

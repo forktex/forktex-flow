@@ -103,9 +103,7 @@ class Advance:
         await self._enter(instance, definition.model, definition.model.start.id)
         return instance.id
 
-    async def complete(
-        self, element_run_id: UUID, output: JsonObject, *, expected: str = "running", skipped: bool = False
-    ) -> bool:
+    async def complete(self, element_run_id: UUID, output: JsonObject, *, expected: str = "running") -> bool:
         run = await self.session.get(ElementRun, element_run_id)
         if run is None:
             return False
@@ -126,17 +124,12 @@ class Advance:
                 await self._round(instance, element, run, decision)
                 return True
             output = decision.output
-        run.status = "skipped" if skipped else "completed"
+        run.status = "completed"
         run.output = output
         run.finished_at = iso.now()
         run.heartbeat_at = None
         instance.variables = self._merge(instance, element, output)
-        _instances.emit(
-            self.session,
-            instance.id,
-            "element_skipped" if skipped else "element_completed",
-            {"element": run.element_id},
-        )
+        _instances.emit(self.session, instance.id, "element_completed", {"element": run.element_id})
         if found is not None:
             await self._close_round(instance, found[0], found[1])
             return True

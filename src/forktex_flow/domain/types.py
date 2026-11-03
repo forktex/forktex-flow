@@ -34,7 +34,7 @@ from pydantic import Field
 from forktex_flow.domain.process import ProcessModel
 
 InstanceStatus = Literal["active", "completed", "failed", "cancelled"]
-ElementStatus = Literal["pending", "running", "waiting", "completed", "skipped", "failed", "cancelled"]
+ElementStatus = Literal["pending", "running", "waiting", "completed", "failed", "cancelled"]
 TriggeredBy = Literal["manual", "schedule", "call"]
 
 #: The statuses an instance does not leave, and at which it acquires a ``finished_at``.
@@ -45,8 +45,6 @@ OPEN_ELEMENT_STATUSES: tuple[str, ...] = ("pending", "running", "waiting")
 
 #: The namespace a code-declared workflow lives in, and the one every call defaults to.
 DEFAULT_NAMESPACE = "default"
-
-TerminalHook = Literal["after_complete", "after_fail"]
 
 
 class DefinitionInfo(BaseWireValueObject):
@@ -59,6 +57,18 @@ class DefinitionInfo(BaseWireValueObject):
     #: What was deployed, verbatim: BPMN XML as given, or the model's JSON.
     source: str
     created_at: datetime
+
+
+class InstanceEventInfo(BaseWireValueObject):
+    """One entry of an instance's history: the engine's own (``element_started``, ``instance_completed``, …) or
+    one a handler emitted.
+    """
+
+    id: int
+    instance_id: UUID
+    ts: datetime
+    event_type: str
+    payload: JsonObject
 
 
 class ElementRunInfo(BaseWireValueObject):
@@ -124,10 +134,10 @@ __all__ = [
     "DefinitionInfo",
     "ElementRunInfo",
     "ElementStatus",
+    "InstanceEventInfo",
     "InstanceInfo",
     "InstanceStatus",
     "InstanceSummary",
     "Job",
-    "TerminalHook",
     "TriggeredBy",
 ]

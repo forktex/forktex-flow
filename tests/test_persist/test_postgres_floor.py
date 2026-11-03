@@ -57,9 +57,7 @@ async def test_the_advertised_postgres_floor_runs_a_workflow() -> None:
     container, url = start_postgres(f"postgres:{FLOOR}-alpine")
     try:
         flow = Flow(database_url=url.render_as_string(hide_password=False))
-        flow.pipeline("floor.check", state=FloorState)(
-            type("FloorPipeline", (), {"steps": [_first, step(_guarded, when=lambda s: s["run_guarded"])]})
-        )
+        flow.pipeline("floor.check", state=FloorState, steps=[_first, step(_guarded, when={"var": "run_guarded"})])
         await flow.init()
 
         async with flow.transaction() as session:

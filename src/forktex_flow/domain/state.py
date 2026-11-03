@@ -29,8 +29,10 @@ import json
 from collections.abc import Callable
 from typing import Annotated, Any, get_args, get_origin
 
+from forktex.error import BadRequestError
 from forktex.log import get_logger
 from forktex.types import JsonObject
+from pydantic import BaseModel, ValidationError
 
 from forktex_flow.errors import StateNotSerialisable
 
@@ -90,7 +92,28 @@ def check_variables(output: object) -> None:
         ) from exc
 
 
-__all__ = ["ReducerFn", "apply_state_update", "check_variables", "extract_reducers"]
+def validate_state[M: BaseModel](state: type[M], variables: JsonObject) -> M:
+    """Raises ``BadRequestError`` listing every field that does not match."""
+    try:
+        return state.model_validate(variables)
+    except ValidationError as exc:
+        fields = "; ".join(
+            f"{'.'.join(str(p) for p in error['loc']) or '(root)'}: {error['msg']}" for error in exc.errors()
+        )
+        raise BadRequestError(f"variables do not match {state.__name__}: {fields}") from exc
+
+
+def to_variables(output: object) -> JsonObject:
+    """A handler's return value as the variables it changes: a pydantic model counts only the fields that were set,
+    and ``None`` changes nothing. Raises ``StateNotSerialisable`` for anything else JSONB cannot hold.
+    """
+    if isinstance(output, BaseModel):
+        output = output.model_dump(mode="json", exclude_unset=True)
+    check_variables(output)
+    return output if isinstance(output, dict) else {}
+
+
+__all__ = ["ReducerFn", "apply_state_update", "check_variables", "extract_reducers", "to_variables", "validate_state"]
 
 
 def _resolved_hints(state_cls: type) -> dict[str, object]:

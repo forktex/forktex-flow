@@ -219,7 +219,8 @@ class Driver:
                 logger.warning("forktex_flow.driver: schedule %s/%s has no deployed definition", row.namespace, row.key)
                 return
             advance = Advance(self.runtime, session)
-            await advance.start(definition, variables={}, metadata={}, triggered_by="schedule")
+            variables = self.runtime.registry.initial(row.key, {})
+            await advance.start(definition, variables=variables, metadata={}, triggered_by="schedule")
         await notify(self.runtime, advance.finished)
 
     async def _pause(self, seconds: float, wake: asyncio.Event | None = None) -> None:

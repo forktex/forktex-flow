@@ -21,98 +21,79 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""The ``@step`` decorator and the spec it produces. The two forms cannot be confused: the second requires ``fn``
-positionally.
-"""
+"""What a pipeline is made of: ``step`` entries, and the one shape every step and handler function has."""
 
 from __future__ import annotations
 
+import inspect
+import re
 from collections.abc import Callable, Coroutine
-from typing import Any, overload
+from typing import Any
 
 from forktex.error import BadRequestError
-from forktex.types import BaseValueObject
+from forktex.types import BaseValueObject, JsonObject
+from pydantic import Field
 
-_STEP_META_ATTR = "__forktex_step_meta__"
+from forktex_flow.domain.process import PRIVATE_SEPARATOR
 
+__all__ = ["HandlerFn", "StepSpec", "check_handler", "step"]
 
-class StepMeta(BaseValueObject):
-    """A step's own retry contract; what it leaves unset comes from the ``Flow``'s ``RuntimeConfig``."""
+#: ``async def name(ctx: Ctx, state) -> dict | BaseModel | None``.
+HandlerFn = Callable[[Any, Any], Coroutine[Any, Any, object]]
 
-    max_attempts: int | None = None
-    backoff: tuple[float, ...] | None = None
-
-
-#: ``async def fn(ctx: Ctx, variables: dict[str, Any]) -> dict[str, Any] | None`` — a handler returns the output
-#: merged into the instance's variables.
-HandlerFn = Callable[[Any, dict[str, Any]], Coroutine[Any, Any, dict[str, Any] | None]]
-
-#: A pipeline step's guard, evaluated against the variables before the step runs.
-WhenFn = Callable[[dict[str, Any]], bool]
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 
 
 class StepSpec(BaseValueObject):
-    fn: Callable[..., Any]
-    when: WhenFn | None = None
-    max_attempts: int | None = None
+    """One pipeline entry: a function run as a private step, or the task type of a shared handler."""
+
+    target: Callable[..., Any] | str
+    name: str
+    when: JsonObject | None = None
+    max_attempts: int | None = Field(default=None, ge=1)
     backoff: tuple[float, ...] | None = None
 
 
-def step_meta(fn: object) -> StepMeta | None:
-    meta = getattr(fn, _STEP_META_ATTR, None)
-    return meta if isinstance(meta, StepMeta) else None
-
-
-# The three call shapes, declared separately so a caller gets the type it
-# actually receives. A single union return is technically true and practically
-# useless: `@step` hands back the function unchanged, but a union makes every
-# later `step(decorated, when=...)` and `scheduled(...)(decorated)` a type error.
-@overload
-def step(fn: Callable[..., Any], /) -> Callable[..., Any]: ...
-
-
-@overload
 def step(
-    fn: Callable[..., Any],
+    target: Callable[..., Any] | str,
     /,
     *,
-    max_attempts: int | None = ...,
-    backoff: tuple[float, ...] | None = ...,
-    when: Callable[[dict[str, Any]], bool] | None = ...,
-) -> StepSpec: ...
-
-
-@overload
-def step(
-    fn: None = ...,
-    /,
-    *,
-    max_attempts: int | None = ...,
-    backoff: tuple[float, ...] | None = ...,
-    when: Callable[[dict[str, Any]], bool] | None = ...,
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]: ...
-
-
-def step(
-    fn: Callable[..., Any] | None = None,
-    /,
-    *,
+    name: str | None = None,
+    when: JsonObject | None = None,
     max_attempts: int | None = None,
     backoff: tuple[float, ...] | None = None,
-    when: Callable[[dict[str, Any]], bool] | None = None,
-) -> Callable[..., Any] | StepSpec:
-    """Attach a retry contract to a step, or build a guarded pipeline entry. ``fn`` must be positional; a bare
-    ``@step`` changes nothing.
+) -> StepSpec:
+    """A pipeline entry. ``name`` defaults to the function's name or the task type, and is the step's identity
+    across deploys. ``when`` is a JSON Logic rule over the variables; when it is false the step is not run.
+    Raises ``BadRequestError`` for anything that cannot be a step.
     """
-    if fn is None:
-        if when is not None:
-            raise BadRequestError("step(when=...) requires fn as a positional argument")
+    if isinstance(target, str):
+        if not target or PRIVATE_SEPARATOR in target:
+            raise BadRequestError(f"{target!r} is not a shared task type; it must be non-empty and contain no ':'")
+        default_name = target
+    else:
+        check_handler(target)
+        default_name = getattr(target, "__name__", "")
+    chosen = default_name if name is None else name
+    if not _NAME.fullmatch(chosen):
+        raise BadRequestError(
+            f"step name {chosen!r} must start with a letter or '_' and contain only letters, digits, '_', '.' or '-'; "
+            "pass name="
+        )
+    if when is not None and not isinstance(when, dict):
+        raise BadRequestError(f"step {chosen!r}: when= is a JSON Logic rule such as {{'var': 'express'}}")
+    return StepSpec(target=target, name=chosen, when=when, max_attempts=max_attempts, backoff=backoff)
 
-        def _attach(target: Callable[..., Any]) -> Callable[..., Any]:
-            setattr(target, _STEP_META_ATTR, StepMeta(max_attempts=max_attempts, backoff=backoff))
-            return target
 
-        return _attach
-    if when is not None or max_attempts is not None or backoff is not None:
-        return StepSpec(fn=fn, when=when, max_attempts=max_attempts, backoff=backoff)
-    return fn
+def check_handler(fn: object) -> None:
+    """Raises ``BadRequestError`` unless ``fn`` is ``async def name(ctx, state)``: exactly two positional
+    parameters.
+    """
+    label = getattr(fn, "__qualname__", repr(fn))
+    if not inspect.iscoroutinefunction(fn):
+        raise BadRequestError(f"{label} must be an async function: async def name(ctx, state)")
+    parameters = list(inspect.signature(fn).parameters.values())
+    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    if len(parameters) != 2 or any(parameter.kind not in positional for parameter in parameters):
+        found = ", ".join(str(parameter) for parameter in parameters)
+        raise BadRequestError(f"{label} must take exactly (ctx, state); it takes ({found})")

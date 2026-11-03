@@ -56,7 +56,7 @@ async def _prune(ctx, state):
 @pytest.mark.asyncio
 async def test_a_due_schedule_starts_an_instance_once(postgres_url_str, schema):
     async with Flow(postgres_url_str, schema=schema, config=FAST) as flow:
-        flow.scheduled("prune", cron="0 3 * * *")(_prune)
+        flow.pipeline("prune", cron="0 3 * * *", steps=[_prune])
         await flow.init()
         await _make_due(flow)
         await flow.start_driver()
@@ -79,7 +79,7 @@ async def test_a_due_schedule_starts_an_instance_once(postgres_url_str, schema):
 @pytest.mark.asyncio
 async def test_a_disarmed_schedule_does_not_fire_and_a_redeploy_keeps_an_operator_s_choice(postgres_url_str, schema):
     async with Flow(postgres_url_str, schema=schema, config=FAST) as flow:
-        flow.scheduled("reap", cron="*/5 * * * *", enabled=False)(_prune)
+        flow.pipeline("reap", cron="*/5 * * * *", enabled=False, steps=[_prune])
         await flow.init()
         await _make_due(flow)
         await flow.start_driver()
@@ -89,7 +89,7 @@ async def test_a_disarmed_schedule_does_not_fire_and_a_redeploy_keeps_an_operato
             await session.execute(sa.update(Schedule).values(enabled=True))
 
     async with Flow(postgres_url_str, schema=schema) as redeployed:
-        redeployed.scheduled("reap", cron="*/10 * * * *", enabled=False)(_prune)
+        redeployed.pipeline("reap", cron="*/10 * * * *", enabled=False, steps=[_prune])
         await redeployed.init()
         (row,) = await _rows(redeployed)
 

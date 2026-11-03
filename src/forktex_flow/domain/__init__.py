@@ -24,7 +24,7 @@
 """Flow's vocabulary: the process model, its conditions, and the value objects the engine reads and writes."""
 
 from forktex_flow.domain.config import RuntimeConfig
-from forktex_flow.domain.node import HandlerFn, StepMeta, StepSpec, WhenFn, step, step_meta
+from forktex_flow.domain.node import HandlerFn, StepSpec, check_handler, step
 from forktex_flow.domain.process import (
     Activation,
     AdHocDecision,
@@ -74,12 +74,10 @@ __all__ = [
     "SequenceFlow",
     "ServiceTask",
     "StartEvent",
-    "StepMeta",
     "StepSpec",
     "UserTask",
-    "WhenFn",
     "apply_state_update",
+    "check_handler",
     "extract_reducers",
     "step",
-    "step_meta",
 ]

@@ -23,8 +23,8 @@
 
 """Version, CHANGELOG, dist/ and (optionally) the git tag agree before a publish.
 
-    python scripts/release_check.py            # version vs CHANGELOG and dist/
-    python scripts/release_check.py v1.0.0     # ...and vs the git tag
+python scripts/release_check.py            # version vs CHANGELOG and dist/
+python scripts/release_check.py v1.0.0     # ...and vs the git tag
 """
 
 from __future__ import annotations

@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS {schema}.element_run (
     child_instance_id  UUID         REFERENCES {schema}.instance(id) ON DELETE SET NULL,
     input              JSONB,
     CONSTRAINT ck_element_run_status
-        CHECK (status IN ('pending','running','waiting','completed','skipped','failed','cancelled')),
+        CHECK (status IN ('pending','running','waiting','completed','failed','cancelled')),
     CONSTRAINT ck_element_run_attempts CHECK (attempts >= 0 AND max_attempts >= 1),
     CONSTRAINT uq_element_run_identity UNIQUE (instance_id, element_id)
 );

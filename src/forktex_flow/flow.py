@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Self
 
 import sqlalchemy as sa
 from forktex import iso
@@ -36,10 +36,12 @@ from forktex.database import Database, advisory_key
 from forktex.error import BadRequestError, ConflictError, NotFoundError
 from forktex.log import get_logger
 from forktex.types import JsonObject
+from pydantic import BaseModel
 
 from forktex_flow.domain.bpmn import parse_bpmn
 from forktex_flow.domain.config import RuntimeConfig
-from forktex_flow.domain.process import ProcessModel
+from forktex_flow.domain.node import HandlerFn, StepSpec, check_handler
+from forktex_flow.domain.process import PRIVATE_SEPARATOR, ProcessModel
 from forktex_flow.domain.state import check_variables
 from forktex_flow.domain.types import DEFAULT_NAMESPACE, DefinitionInfo
 from forktex_flow.errors import FlowClosed
@@ -49,7 +51,7 @@ from forktex_flow.persist.migrations import apply_migrations
 from forktex_flow.persist.models import ElementRun
 from forktex_flow.persist.store import FlowStore
 from forktex_flow.read.instance import InstanceQuery, WorkflowInstance, bind_instance
-from forktex_flow.runtime.compiler import compile_pipeline, compile_scheduled
+from forktex_flow.runtime.compiler import compile_pipeline
 from forktex_flow.runtime.context import FlowRuntime
 from forktex_flow.runtime.driver import Driver
 from forktex_flow.runtime.engine import Advance, notify
@@ -60,7 +62,6 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-    from forktex_flow.domain.node import HandlerFn
     from forktex_flow.extension import FlowExtension
 
 __all__ = ["Flow"]
@@ -195,34 +196,38 @@ class Flow:
 
     # ── Declaration ──────────────────────────────────────────────────────
 
-    def handler(self, task_type: str) -> Callable[[HandlerFn], HandlerFn]:
-        """Run ``fn`` for every service task of ``task_type`` this Flow claims. Raises ``AlreadyExistsError`` for a
-        type it already handles.
+    def handler(self, task_type: str, *, state: type[BaseModel] | None = None) -> Callable[[HandlerFn], HandlerFn]:
+        """Run the decorated ``async def name(ctx, state)`` for every service task (or ad-hoc decider) of
+        ``task_type`` this Flow claims, in any namespace. With ``state``, it receives the variables as that model.
+        Raises ``BadRequestError`` for another function shape or a task type containing ``:``, and
+        ``AlreadyExistsError`` for a type it already handles.
         """
+        if not task_type or PRIVATE_SEPARATOR in task_type:
+            raise BadRequestError(f"task type {task_type!r} must be non-empty; ':' is reserved for pipeline steps")
 
         def _decorator(fn: HandlerFn) -> HandlerFn:
-            self._registry.handle(Handler(task_type=task_type, fn=fn))
-            return fn
-
-        return _decorator
-
-    def scheduled(
-        self, key: str, *, cron: str, state: type | None = None, enabled: bool = True
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._registry.declare(*compile_scheduled(fn, key=key, cron=cron, state_cls=state, enabled=enabled))
+            check_handler(fn)
+            self._registry.handle(Handler(task_type=task_type, fn=fn, state=state))
             return fn
 
         return _decorator
 
     def pipeline(
-        self, key: str, *, state: type | None = None, cron: str | None = None, enabled: bool = True
-    ) -> Callable[[type], type]:
-        def _decorator(cls: type) -> type:
-            self._registry.declare(*compile_pipeline(cls, key=key, cron=cron, state_cls=state, enabled=enabled))
-            return cls
-
-        return _decorator
+        self,
+        key: str,
+        *,
+        steps: Sequence[StepSpec | HandlerFn | str],
+        state: type | None = None,
+        cron: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        """Declare start → each step → end, deployed into ``DEFAULT_NAMESPACE``. A step is a function, a shared
+        handler's task type, or ``step(...)`` of either. ``state`` is a pydantic model (validated at ``start()``,
+        handed to each step) or a ``TypedDict``; either may annotate reducers. ``cron`` schedules it, and
+        ``enabled=False`` declares that schedule disarmed. Raises ``BadRequestError`` or ``AlreadyExistsError``
+        naming what cannot be declared.
+        """
+        self._registry.declare(*compile_pipeline(key, steps, state=state, cron=cron, enabled=enabled))
 
     def registered(self) -> list[str]:
         return self._registry.keys()
@@ -279,7 +284,7 @@ class Flow:
         if definition is None:
             definition = await self.definition(key, namespace=namespace, version=version)
 
-        start_variables = dict(variables or {})
+        start_variables = self._registry.initial(key, dict(variables or {}))
         check_variables(start_variables)
         start_metadata = dict(metadata or {})
         for extension in self.extensions:

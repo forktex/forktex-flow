@@ -119,8 +119,8 @@ async def test_extensions_see_every_start_and_outcome_and_cannot_change_one(post
         raise RuntimeError("down")
 
     async with Flow(postgres_url_str, schema=schema, extensions=[Broken(), recorder]) as flow:
-        flow.pipeline("good")(type("Good", (), {"steps": [_noop]}))
-        flow.pipeline("bad")(type("Bad", (), {"steps": [step(boom, max_attempts=1)]}))
+        flow.pipeline("good", steps=[_noop])
+        flow.pipeline("bad", steps=[step(boom, max_attempts=1)])
         good = await run_to_completion(flow, "good")
         await run_to_completion(flow, "bad")
 
